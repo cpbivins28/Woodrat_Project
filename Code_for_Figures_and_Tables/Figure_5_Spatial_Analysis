@@ -1,0 +1,1033 @@
+################################################################################
+# PURPOSE:
+#   Unified H2 + H4 script for McKenzie nest-level spatial heterogeneity.
+#
+#   This script:
+#     1) Tests H2 separately at each threshold using the same model structure:
+#          - Detection model: AnyDetected ~ Nest_ID
+#          - Richness model:  OTU_Richness ~ Nest_ID
+#     2) Repeats that analysis across thresholds to explicitly evaluate H4
+#        robustness.
+#     3) Exports 1.0% threshold outputs for plotting and biological description.
+#     4) Exports 1.0% OTU-level summaries to identify which taxa drive the pattern.
+#
+# INPUTS:
+#   1) otu_table_collapsed_relative.csv
+#   2) guild_table_collapsed.csv
+#   3) metadata.csv
+#
+# THRESHOLDS:
+#   - 0.0  -> interpreted as RA > 0
+#   - 0.2  -> interpreted as RA >= 0.2
+#   - 0.5  -> interpreted as RA >= 0.5
+#   - 1.0  -> interpreted as RA >= 1.0
+#   - 1.5  -> interpreted as RA >= 1.5
+#
+# FOCAL DATA SUBSET:
+#   - Site: Mckenzie
+#   - Nests: M1, M3, M6, M8, M9, M10
+#
+# FOCAL GUILDS:
+#   - Truffle
+#   - Epigeous_ECM
+#
+# MAIN OUTPUT GROUPS:
+#   A) Combined sample- and nest-level summary tables across all thresholds
+#   B) Per-threshold model outputs for detection and richness
+#   C) Combined robustness summary table across thresholds
+#   D) Dedicated 1.0% plotting tables
+#   E) Dedicated 1.0% OTU-level interpretation tables
+#
+# NOTES:
+#   - Relative abundance values are percentages summing to ~100 per sample.
+#   - No pipes are used here to avoid %>% issues in the local session.
+################################################################################
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(broom)
+library(tibble)
+library(MASS)
+
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_h1_h4_spatial"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+thresholds <- c(0.0, 0.2, 0.5, 1.0, 1.5)
+plot_threshold <- 1.0
+
+keep_site  <- "Mckenzie"
+keep_nests <- c("M1", "M3", "M6", "M8", "M9", "M10")
+
+# --------------------------------------------------
+# Helper function: threshold label for filenames
+# --------------------------------------------------
+threshold_label <- function(x) {
+  if (x == 0) return("0pct")
+  out <- gsub("\\.", "p", as.character(x))
+  paste0(out, "pct")
+}
+
+# --------------------------------------------------
+# Helper function: safely extract p-value column from drop1 output
+# --------------------------------------------------
+extract_drop1_table <- function(drop1_obj) {
+  tab <- as.data.frame(drop1_obj)
+  tab <- tibble::rownames_to_column(tab, "Term")
+  tab <- dplyr::filter(tab, Term != "<none>")
+
+  p_col <- grep("^Pr\\(", colnames(tab), value = TRUE)
+  if (length(p_col) != 1) {
+    stop("Could not uniquely identify p-value column in drop1 table.")
+  }
+
+  if ("LRT" %in% colnames(tab)) {
+    stat_col <- "LRT"
+  } else if ("Deviance" %in% colnames(tab)) {
+    stat_col <- "Deviance"
+  } else {
+    stop("Could not identify test statistic column in drop1 table.")
+  }
+
+  out <- dplyr::transmute(
+    tab,
+    Term = Term,
+    Df = Df,
+    Chisq = .data[[stat_col]],
+    p_value = .data[[p_col]]
+  )
+  return(out)
+}
+
+# --------------------------------------------------
+# Helper function: compute overdispersion ratio for Poisson GLM
+# --------------------------------------------------
+overdispersion_ratio <- function(model) {
+  rp <- residuals(model, type = "pearson")
+  rdf <- df.residual(model)
+  if (rdf <= 0) return(NA_real_)
+  sum(rp^2) / rdf
+}
+
+# --------------------------------------------------
+# Helper function: fit richness model with NB fallback
+# --------------------------------------------------
+fit_richness_model <- function(dat) {
+  pois_model <- stats::glm(
+    OTU_Richness ~ Nest_ID,
+    family = stats::poisson,
+    data = dat
+  )
+
+  disp <- overdispersion_ratio(pois_model)
+
+  if (!is.na(disp) && disp > 1.5) {
+    final_model <- MASS::glm.nb(
+      OTU_Richness ~ Nest_ID,
+      data = dat
+    )
+    final_family <- "negative_binomial"
+  } else {
+    final_model <- pois_model
+    final_family <- "poisson"
+  }
+
+  out <- list(
+    model = final_model,
+    family = final_family,
+    poisson_overdispersion_ratio = disp
+  )
+
+  return(out)
+}
+
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
+otu   <- readr::read_csv(otu_fp, show_col_types = FALSE)
+guild <- readr::read_csv(guild_fp, show_col_types = FALSE)
+meta  <- readr::read_csv(meta_fp, show_col_types = FALSE)
+
+# --------------------------------------------------
+# Basic checks
+# --------------------------------------------------
+stopifnot("OTU_ID" %in% names(otu))
+stopifnot(all(c("OTU_ID", "primary_lifestyle", "Fruitbody_type_template") %in% names(guild)))
+stopifnot(all(c("Sample_ID", "Site", "Nest_ID") %in% names(meta)))
+
+# --------------------------------------------------
+# Restrict metadata to McKenzie + 6 focal nests
+# --------------------------------------------------
+meta_mck <- dplyr::filter(meta, Site == keep_site, Nest_ID %in% keep_nests)
+meta_mck <- dplyr::select(meta_mck, Sample_ID, Nest_ID)
+meta_mck <- dplyr::distinct(meta_mck)
+
+if (nrow(meta_mck) == 0) {
+  stop("No rows after filtering to Mckenzie + keep_nests. Check Site/Nest_ID values.")
+}
+
+meta_mck <- dplyr::mutate(
+  meta_mck,
+  Nest_ID = factor(Nest_ID, levels = keep_nests)
+)
+
+mck_samples <- unique(meta_mck$Sample_ID)
+
+# --------------------------------------------------
+# Define guild membership EXACTLY
+# --------------------------------------------------
+truffle_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template == "gasteroid-hypogeous"
+)
+
+truffle_ids <- unique(truffle_tbl$OTU_ID)
+
+epigeous_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template %in% c(
+    "agaricoid",
+    "gasteroid",
+    "clavarioid",
+    "apothecium_(hymenium_on_surface)"
+  )
+)
+
+epigeous_ids <- unique(epigeous_tbl$OTU_ID)
+
+# --------------------------------------------------
+# Build taxonomy table for OTU-level outputs
+# --------------------------------------------------
+truffle_tax <- dplyr::filter(
+  guild,
+  OTU_ID %in% truffle_ids
+)
+
+truffle_tax <- dplyr::select(
+  truffle_tax,
+  OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+truffle_tax <- dplyr::mutate(truffle_tax, Guild = "Truffle")
+
+epigeous_tax <- dplyr::filter(
+  guild,
+  OTU_ID %in% epigeous_ids
+)
+
+epigeous_tax <- dplyr::select(
+  epigeous_tax,
+  OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+epigeous_tax <- dplyr::mutate(epigeous_tax, Guild = "Epigeous_ECM")
+
+guild_tax <- dplyr::bind_rows(truffle_tax, epigeous_tax)
+guild_tax <- dplyr::distinct(guild_tax)
+
+# --------------------------------------------------
+# Match OTU sample columns to metadata sample IDs
+# --------------------------------------------------
+otu_samples <- setdiff(colnames(otu), "OTU_ID")
+mck_samples_present <- intersect(otu_samples, mck_samples)
+
+if (length(mck_samples_present) == 0) {
+  stop("No McKenzie Sample_IDs found in OTU table columns. Sample_ID mismatch.")
+}
+
+# --------------------------------------------------
+# Build long OTU table for McKenzie samples only
+# --------------------------------------------------
+otu_sub <- dplyr::select(otu, OTU_ID, dplyr::all_of(mck_samples_present))
+
+otu_long <- tidyr::pivot_longer(
+  otu_sub,
+  cols = -OTU_ID,
+  names_to = "Sample_ID",
+  values_to = "RA"
+)
+
+otu_long$RA[is.na(otu_long$RA)] <- 0
+
+otu_long <- dplyr::left_join(otu_long, meta_mck, by = "Sample_ID")
+
+otu_long <- dplyr::mutate(
+  otu_long,
+  Guild = dplyr::case_when(
+    OTU_ID %in% truffle_ids ~ "Truffle",
+    OTU_ID %in% epigeous_ids ~ "Epigeous_ECM",
+    TRUE ~ NA_character_
+  )
+)
+
+otu_long <- dplyr::filter(otu_long, !is.na(Guild))
+
+otu_long <- dplyr::mutate(
+  otu_long,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+# --------------------------------------------------
+# Sample-level summaries across thresholds
+# --------------------------------------------------
+sample_level_list <- list()
+
+for (i in seq_along(thresholds)) {
+
+  th <- thresholds[i]
+  tmp <- otu_long
+
+  if (th == 0) {
+    tmp <- dplyr::mutate(tmp, Detected = RA > 0)
+  } else {
+    tmp <- dplyr::mutate(tmp, Detected = RA >= th)
+  }
+
+  tmp <- dplyr::group_by(tmp, Sample_ID, Nest_ID, Guild)
+
+  tmp <- dplyr::summarise(
+    tmp,
+    AnyDetected = as.integer(any(Detected)),
+    OTU_Richness = sum(Detected),
+    .groups = "drop"
+  )
+
+  tmp <- dplyr::mutate(tmp, Threshold = th)
+  sample_level_list[[i]] <- tmp
+}
+
+sample_level_all <- dplyr::bind_rows(sample_level_list)
+
+sample_level_all <- dplyr::mutate(
+  sample_level_all,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+readr::write_csv(
+  sample_level_all,
+  file.path(out_dir, "mckenzie_h1_h4_sample_level_all_thresholds.csv")
+)
+
+# --------------------------------------------------
+# Nest-level summary across thresholds
+# --------------------------------------------------
+nest_summary_all <- dplyr::group_by(sample_level_all, Nest_ID, Guild, Threshold)
+
+nest_summary_all <- dplyr::summarise(
+  nest_summary_all,
+  N_Samples = dplyr::n(),
+  Detection_Frequency = mean(AnyDetected),
+  Mean_Sample_Richness = mean(OTU_Richness),
+  Median_Sample_Richness = stats::median(OTU_Richness),
+  Samples_With_Detection = sum(AnyDetected),
+  .groups = "drop"
+)
+
+readr::write_csv(
+  nest_summary_all,
+  file.path(out_dir, "mckenzie_h1_h4_nest_level_summary_all_thresholds.csv")
+)
+
+# --------------------------------------------------
+# Dedicated 1.0% plotting tables
+# --------------------------------------------------
+sample_level_plot <- dplyr::filter(sample_level_all, Threshold == plot_threshold)
+nest_summary_plot <- dplyr::filter(nest_summary_all, Threshold == plot_threshold)
+
+readr::write_csv(
+  sample_level_plot,
+  file.path(out_dir, "mckenzie_h1_sample_level_detection_1pct.csv")
+)
+
+readr::write_csv(
+  nest_summary_plot,
+  file.path(out_dir, "mckenzie_h1_nest_level_summary_1pct.csv")
+)
+
+# --------------------------------------------------
+# Run H1 models separately at each threshold
+# --------------------------------------------------
+robustness_rows <- list()
+diagnostics_rows <- list()
+
+for (i in seq_along(thresholds)) {
+
+  th <- thresholds[i]
+  th_lab <- threshold_label(th)
+
+  sample_th <- dplyr::filter(sample_level_all, Threshold == th)
+
+  # ================================================
+  # Truffle
+  # ================================================
+  truf_dat <- dplyr::filter(sample_th, Guild == "Truffle")
+
+  # Detection model
+  truf_det_glm <- stats::glm(
+    AnyDetected ~ Nest_ID,
+    family = stats::binomial,
+    data = truf_dat
+  )
+
+  truf_det_anova <- stats::drop1(truf_det_glm, test = "Chisq")
+  truf_det_anova <- extract_drop1_table(truf_det_anova)
+  truf_det_coef  <- broom::tidy(truf_det_glm)
+
+  truf_det_anova <- dplyr::mutate(
+    truf_det_anova,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Detection"
+  )
+
+  truf_det_coef <- dplyr::mutate(
+    truf_det_coef,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Detection"
+  )
+
+  readr::write_csv(
+    truf_det_anova,
+    file.path(out_dir, paste0("mckenzie_h1_detection_anova_truffle_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    truf_det_coef,
+    file.path(out_dir, paste0("mckenzie_h1_detection_coefficients_truffle_", th_lab, ".csv"))
+  )
+
+  # Richness model
+  truf_rich_fit <- fit_richness_model(truf_dat)
+  truf_rich_model <- truf_rich_fit$model
+  truf_rich_family <- truf_rich_fit$family
+  truf_disp <- truf_rich_fit$poisson_overdispersion_ratio
+
+  truf_rich_anova <- stats::drop1(truf_rich_model, test = "Chisq")
+  truf_rich_anova <- extract_drop1_table(truf_rich_anova)
+  truf_rich_coef  <- broom::tidy(truf_rich_model)
+
+  truf_rich_anova <- dplyr::mutate(
+    truf_rich_anova,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Richness",
+    Richness_Model = truf_rich_family,
+    Poisson_Overdispersion_Ratio = truf_disp
+  )
+
+  truf_rich_coef <- dplyr::mutate(
+    truf_rich_coef,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Richness",
+    Richness_Model = truf_rich_family,
+    Poisson_Overdispersion_Ratio = truf_disp
+  )
+
+  readr::write_csv(
+    truf_rich_anova,
+    file.path(out_dir, paste0("mckenzie_h1_richness_anova_truffle_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    truf_rich_coef,
+    file.path(out_dir, paste0("mckenzie_h1_richness_coefficients_truffle_", th_lab, ".csv"))
+  )
+
+  # Robustness row: truffle
+  truf_det_nest <- dplyr::filter(truf_det_anova, Term == "Nest_ID")
+  truf_rich_nest <- dplyr::filter(truf_rich_anova, Term == "Nest_ID")
+
+  robustness_rows[[length(robustness_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Truffle",
+    Detection_Nest_Chisq = truf_det_nest$Chisq,
+    Detection_Nest_Df = truf_det_nest$Df,
+    Detection_Nest_p = truf_det_nest$p_value,
+    Richness_Nest_Chisq = truf_rich_nest$Chisq,
+    Richness_Nest_Df = truf_rich_nest$Df,
+    Richness_Nest_p = truf_rich_nest$p_value,
+    Richness_Model = truf_rich_family,
+    Poisson_Overdispersion_Ratio = truf_disp
+  )
+
+  diagnostics_rows[[length(diagnostics_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Truffle",
+    Richness_Model = truf_rich_family,
+    Poisson_Overdispersion_Ratio = truf_disp
+  )
+
+  # ================================================
+  # Epigeous ECM
+  # ================================================
+  epi_dat <- dplyr::filter(sample_th, Guild == "Epigeous_ECM")
+
+  # Detection model
+  epi_det_glm <- stats::glm(
+    AnyDetected ~ Nest_ID,
+    family = stats::binomial,
+    data = epi_dat
+  )
+
+  epi_det_anova <- stats::drop1(epi_det_glm, test = "Chisq")
+  epi_det_anova <- extract_drop1_table(epi_det_anova)
+  epi_det_coef  <- broom::tidy(epi_det_glm)
+
+  epi_det_anova <- dplyr::mutate(
+    epi_det_anova,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Detection"
+  )
+
+  epi_det_coef <- dplyr::mutate(
+    epi_det_coef,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Detection"
+  )
+
+  readr::write_csv(
+    epi_det_anova,
+    file.path(out_dir, paste0("mckenzie_h1_detection_anova_epigeous_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    epi_det_coef,
+    file.path(out_dir, paste0("mckenzie_h1_detection_coefficients_epigeous_", th_lab, ".csv"))
+  )
+
+  # Richness model
+  epi_rich_fit <- fit_richness_model(epi_dat)
+  epi_rich_model <- epi_rich_fit$model
+  epi_rich_family <- epi_rich_fit$family
+  epi_disp <- epi_rich_fit$poisson_overdispersion_ratio
+
+  epi_rich_anova <- stats::drop1(epi_rich_model, test = "Chisq")
+  epi_rich_anova <- extract_drop1_table(epi_rich_anova)
+  epi_rich_coef  <- broom::tidy(epi_rich_model)
+
+  epi_rich_anova <- dplyr::mutate(
+    epi_rich_anova,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Richness",
+    Richness_Model = epi_rich_family,
+    Poisson_Overdispersion_Ratio = epi_disp
+  )
+
+  epi_rich_coef <- dplyr::mutate(
+    epi_rich_coef,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Richness",
+    Richness_Model = epi_rich_family,
+    Poisson_Overdispersion_Ratio = epi_disp
+  )
+
+  readr::write_csv(
+    epi_rich_anova,
+    file.path(out_dir, paste0("mckenzie_h1_richness_anova_epigeous_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    epi_rich_coef,
+    file.path(out_dir, paste0("mckenzie_h1_richness_coefficients_epigeous_", th_lab, ".csv"))
+  )
+
+  # Robustness row: epigeous
+  epi_det_nest <- dplyr::filter(epi_det_anova, Term == "Nest_ID")
+  epi_rich_nest <- dplyr::filter(epi_rich_anova, Term == "Nest_ID")
+
+  robustness_rows[[length(robustness_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Detection_Nest_Chisq = epi_det_nest$Chisq,
+    Detection_Nest_Df = epi_det_nest$Df,
+    Detection_Nest_p = epi_det_nest$p_value,
+    Richness_Nest_Chisq = epi_rich_nest$Chisq,
+    Richness_Nest_Df = epi_rich_nest$Df,
+    Richness_Nest_p = epi_rich_nest$p_value,
+    Richness_Model = epi_rich_family,
+    Poisson_Overdispersion_Ratio = epi_disp
+  )
+
+  diagnostics_rows[[length(diagnostics_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Richness_Model = epi_rich_family,
+    Poisson_Overdispersion_Ratio = epi_disp
+  )
+}
+
+# --------------------------------------------------
+# Export combined robustness tables across thresholds
+# --------------------------------------------------
+robustness_tbl <- do.call(rbind, robustness_rows)
+diagnostics_tbl <- do.call(rbind, diagnostics_rows)
+
+robustness_tbl <- dplyr::arrange(robustness_tbl, Guild, Threshold)
+diagnostics_tbl <- dplyr::arrange(diagnostics_tbl, Guild, Threshold)
+
+readr::write_csv(
+  robustness_tbl,
+  file.path(out_dir, "mckenzie_h1_h4_robustness_summary_across_thresholds.csv")
+)
+
+readr::write_csv(
+  diagnostics_tbl,
+  file.path(out_dir, "mckenzie_h1_h4_richness_model_diagnostics_across_thresholds.csv")
+)
+
+# --------------------------------------------------
+# OTU-level outputs for 1.0% threshold only
+# --------------------------------------------------
+otu_long_tax <- dplyr::left_join(otu_long, guild_tax, by = c("OTU_ID", "Guild"))
+
+otu_detected_plot <- otu_long_tax
+
+if (plot_threshold == 0) {
+  otu_detected_plot <- dplyr::mutate(otu_detected_plot, Detected = RA > 0)
+} else {
+  otu_detected_plot <- dplyr::mutate(otu_detected_plot, Detected = RA >= plot_threshold)
+}
+
+otu_detected_plot <- dplyr::filter(otu_detected_plot, Detected)
+
+# OTU-by-sample detections
+otu_sample_detections <- dplyr::select(
+  otu_detected_plot,
+  Sample_ID, Nest_ID, Guild, OTU_ID, RA,
+  Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+otu_sample_detections <- dplyr::arrange(
+  otu_sample_detections,
+  Guild, Nest_ID, OTU_ID, Sample_ID
+)
+
+readr::write_csv(
+  otu_sample_detections,
+  file.path(out_dir, "mckenzie_h1_otu_sample_detections_1pct.csv")
+)
+
+# Nest-by-OTU summary
+nest_sample_sizes <- dplyr::count(meta_mck, Nest_ID, name = "N_Samples_Total")
+nest_sample_sizes <- dplyr::mutate(
+  nest_sample_sizes,
+  Nest_ID = factor(Nest_ID, levels = keep_nests)
+)
+
+otu_nest_summary <- dplyr::group_by(
+  otu_detected_plot,
+  Nest_ID, Guild, OTU_ID,
+  Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+otu_nest_summary <- dplyr::summarise(
+  otu_nest_summary,
+  Samples_Detected = dplyr::n_distinct(Sample_ID),
+  Mean_RA_When_Detected = mean(RA, na.rm = TRUE),
+  Median_RA_When_Detected = stats::median(RA, na.rm = TRUE),
+  Max_RA_When_Detected = max(RA, na.rm = TRUE),
+  .groups = "drop"
+)
+
+otu_nest_summary <- dplyr::left_join(
+  otu_nest_summary,
+  nest_sample_sizes,
+  by = "Nest_ID"
+)
+
+otu_nest_summary <- dplyr::mutate(
+  otu_nest_summary,
+  Detection_Frequency_Within_Nest = Samples_Detected / N_Samples_Total
+)
+
+otu_nest_summary <- dplyr::arrange(
+  otu_nest_summary,
+  Guild, Nest_ID, dplyr::desc(Samples_Detected), dplyr::desc(Max_RA_When_Detected)
+)
+
+readr::write_csv(
+  otu_nest_summary,
+  file.path(out_dir, "mckenzie_h1_otu_nest_summary_1pct.csv")
+)
+
+# Cumulative unique OTU richness per nest
+nest_cumulative_otu_richness <- dplyr::group_by(
+  otu_detected_plot,
+  Nest_ID, Guild
+)
+
+nest_cumulative_otu_richness <- dplyr::summarise(
+  nest_cumulative_otu_richness,
+  Cumulative_Unique_OTUs = dplyr::n_distinct(OTU_ID),
+  Total_Detection_Events = dplyr::n(),
+  .groups = "drop"
+)
+
+nest_cumulative_otu_richness <- dplyr::arrange(
+  nest_cumulative_otu_richness,
+  Guild, Nest_ID
+)
+
+readr::write_csv(
+  nest_cumulative_otu_richness,
+  file.path(out_dir, "mckenzie_h1_nest_cumulative_otu_richness_1pct.csv")
+)
+
+# Wide nest-by-OTU presence matrix
+otu_nest_presence_matrix <- dplyr::distinct(otu_detected_plot, Nest_ID, Guild, OTU_ID)
+otu_nest_presence_matrix <- dplyr::mutate(otu_nest_presence_matrix, Present = 1L)
+
+otu_nest_presence_matrix <- tidyr::pivot_wider(
+  otu_nest_presence_matrix,
+  names_from = Nest_ID,
+  values_from = Present,
+  values_fill = 0
+)
+
+otu_nest_presence_matrix <- dplyr::arrange(
+  otu_nest_presence_matrix,
+  Guild, OTU_ID
+)
+
+readr::write_csv(
+  otu_nest_presence_matrix,
+  file.path(out_dir, "mckenzie_h1_otu_nest_presence_matrix_1pct.csv")
+)
+
+# --------------------------------------------------
+# Final messages
+# --------------------------------------------------
+message("Done.")
+message("Main outputs written to: ", out_dir)
+message("Key files:")
+message("  mckenzie_h1_h4_sample_level_all_thresholds.csv")
+message("  mckenzie_h1_h4_nest_level_summary_all_thresholds.csv")
+message("  mckenzie_h1_h4_robustness_summary_across_thresholds.csv")
+message("  mckenzie_h1_sample_level_detection_1pct.csv")
+message("  mckenzie_h1_nest_level_summary_1pct.csv")
+message("  mckenzie_h1_otu_nest_summary_1pct.csv")
+message("  mckenzie_h1_nest_cumulative_otu_richness_1pct.csv")
+```
+
+
+
+#### PLOT FIGURE 5 ########
+
+
+"""
+Purpose:
+    Create two separate SVG panels for the McKenzie H2/H4 spatial figure.
+
+Inputs:
+    1) mckenzie_h1_nest_level_summary_1pct.csv
+       - used for Panel A: detection frequency by nest and guild
+    2) mckenzie_h1_nest_cumulative_otu_richness_1pct.csv
+       - used for Panel B: cumulative OTU richness by nest and guild
+
+Logic:
+    - Read the two input CSV files
+    - Standardize nest order and guild order
+    - Build paired bar plots for:
+        Panel A = Detection frequency
+        Panel B = Cumulative OTU richness
+    - Save each panel separately as an SVG
+
+Outputs:
+    1) panel_A_detection_frequency_1pct.svg
+    2) panel_B_cumulative_richness_1pct.svg
+"""
+
+# -----------------------------
+# Imports
+# -----------------------------
+import os
+from pathlib import Path
+
+# Import pandas for table handling.
+import pandas as pd
+
+# Import matplotlib for plotting.
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# File paths
+# -----------------------------
+# Define the base directory containing the R output files.
+base_dir = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_h1_h4_spatial")
+
+# Define the output directory for plots.
+plot_dir = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_h1_h4_spatial/plots")
+
+# Create the plot output directory if it does not already exist.
+plot_dir.mkdir(parents=True, exist_ok=True)
+
+# Define input file paths.
+detection_fp = base_dir / "mckenzie_h1_nest_level_summary_1pct.csv"
+richness_fp = base_dir / "mckenzie_h1_nest_cumulative_otu_richness_1pct.csv"
+
+# -----------------------------
+# User-defined plotting settings
+# -----------------------------
+# Fix the nest order exactly as requested.
+nest_order = ["M1", "M3", "M6", "M8", "M9", "M10"]
+
+# Fix the guild order so plotting is consistent.
+guild_order = ["Truffle", "Epigeous_ECM"]
+
+# Use a color-blind friendly palette.
+# Blue-green for truffles, orange for epigeous ECM.
+guild_colors = {
+    "Truffle": "#1B9E77",
+    "Epigeous_ECM": "#D95F02"
+}
+
+# Define the bar width for paired bars.
+bar_width = 0.38
+
+# -----------------------------
+# Load input data
+# -----------------------------
+# Read the detection-frequency summary table.
+detection_df = pd.read_csv(detection_fp)
+
+# Read the cumulative richness summary table.
+richness_df = pd.read_csv(richness_fp)
+
+# -----------------------------
+# Basic input checks
+# -----------------------------
+# Verify required columns are present in the detection table.
+required_detection_cols = {"Nest_ID", "Guild", "Detection_Frequency"}
+missing_detection = required_detection_cols - set(detection_df.columns)
+if missing_detection:
+    raise ValueError(
+        f"Detection summary file is missing required columns: {sorted(missing_detection)}"
+    )
+
+# Verify required columns are present in the cumulative richness table.
+required_richness_cols = {"Nest_ID", "Guild", "Cumulative_Unique_OTUs"}
+missing_richness = required_richness_cols - set(richness_df.columns)
+if missing_richness:
+    raise ValueError(
+        f"Cumulative richness file is missing required columns: {sorted(missing_richness)}"
+    )
+
+# -----------------------------
+# Standardize categorical order
+# -----------------------------
+# Convert Nest_ID to an ordered categorical in the detection table.
+detection_df["Nest_ID"] = pd.Categorical(
+    detection_df["Nest_ID"],
+    categories=nest_order,
+    ordered=True
+)
+
+# Convert Guild to an ordered categorical in the detection table.
+detection_df["Guild"] = pd.Categorical(
+    detection_df["Guild"],
+    categories=guild_order,
+    ordered=True
+)
+
+# Convert Nest_ID to an ordered categorical in the richness table.
+richness_df["Nest_ID"] = pd.Categorical(
+    richness_df["Nest_ID"],
+    categories=nest_order,
+    ordered=True
+)
+
+# Convert Guild to an ordered categorical in the richness table.
+richness_df["Guild"] = pd.Categorical(
+    richness_df["Guild"],
+    categories=guild_order,
+    ordered=True
+)
+
+# Sort both tables so plotting is deterministic.
+detection_df = detection_df.sort_values(["Nest_ID", "Guild"]).reset_index(drop=True)
+richness_df = richness_df.sort_values(["Nest_ID", "Guild"]).reset_index(drop=True)
+
+# -----------------------------
+# Reshape for plotting
+# -----------------------------
+# Pivot the detection table so rows are nests and columns are guilds.
+detection_wide = detection_df.pivot(
+    index="Nest_ID",
+    columns="Guild",
+    values="Detection_Frequency"
+)
+
+# Reindex to enforce exact nest and guild order.
+detection_wide = detection_wide.reindex(index=nest_order, columns=guild_order)
+
+# Pivot the richness table so rows are nests and columns are guilds.
+richness_wide = richness_df.pivot(
+    index="Nest_ID",
+    columns="Guild",
+    values="Cumulative_Unique_OTUs"
+)
+
+# Reindex to enforce exact nest and guild order.
+richness_wide = richness_wide.reindex(index=nest_order, columns=guild_order)
+
+# -----------------------------
+# Helper function for consistent styling
+# -----------------------------
+def style_axes(ax):
+    """Apply consistent, clean figure styling."""
+    # Remove gridlines as requested.
+    ax.grid(False)
+
+    # Hide the top and right spines for a cleaner look.
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    # Make tick labels readable.
+    ax.tick_params(axis="x", labelsize=11)
+    ax.tick_params(axis="y", labelsize=11)
+
+# -----------------------------
+# Panel A: Detection frequency
+# -----------------------------
+# Create a new figure for Panel A only.
+fig, ax = plt.subplots(figsize=(7, 5))
+
+# Define x positions for nests.
+x_positions = range(len(nest_order))
+
+# Compute offset positions for paired bars.
+x_truffle = [x - bar_width / 2 for x in x_positions]
+x_epigeous = [x + bar_width / 2 for x in x_positions]
+
+# Plot truffle bars.
+ax.bar(
+    x_truffle,
+    detection_wide["Truffle"].values,
+    width=bar_width,
+    label="Truffle",
+    color=guild_colors["Truffle"]
+)
+
+# Plot epigeous ECM bars.
+ax.bar(
+    x_epigeous,
+    detection_wide["Epigeous_ECM"].values,
+    width=bar_width,
+    label="Epigeous ECM",
+    color=guild_colors["Epigeous_ECM"]
+)
+
+# Set x-axis tick positions and labels.
+ax.set_xticks(list(x_positions))
+ax.set_xticklabels(nest_order)
+
+# Label the axes clearly.
+ax.set_xlabel("Nest ID", fontsize=12)
+ax.set_ylabel("Detection frequency", fontsize=12)
+
+# Set the y-axis to proportion scale.
+ax.set_ylim(0, 1)
+
+# Add a simple title for the exported panel.
+ax.set_title("Panel A. Detection frequency at 1.0% threshold", fontsize=13)
+
+# Add legend.
+ax.legend(frameon=False, fontsize=11)
+
+# Apply consistent styling.
+style_axes(ax)
+
+# Tighten layout so labels are not clipped.
+fig.tight_layout()
+
+# Save Panel A as SVG.
+panel_a_fp = plot_dir / "panel_A_detection_frequency_1pct.svg"
+fig.savefig(panel_a_fp, format="svg", bbox_inches="tight")
+
+# Close the figure to avoid carryover.
+plt.close(fig)
+
+# -----------------------------
+# Panel B: Cumulative richness
+# -----------------------------
+# Create a new figure for Panel B only.
+fig, ax = plt.subplots(figsize=(7, 5))
+
+# Plot truffle bars for cumulative richness.
+ax.bar(
+    x_truffle,
+    richness_wide["Truffle"].values,
+    width=bar_width,
+    label="Truffle",
+    color=guild_colors["Truffle"]
+)
+
+# Plot epigeous ECM bars for cumulative richness.
+ax.bar(
+    x_epigeous,
+    richness_wide["Epigeous_ECM"].values,
+    width=bar_width,
+    label="Epigeous ECM",
+    color=guild_colors["Epigeous_ECM"]
+)
+
+# Set x-axis tick positions and labels.
+ax.set_xticks(list(x_positions))
+ax.set_xticklabels(nest_order)
+
+# Label the axes clearly.
+ax.set_xlabel("Nest ID", fontsize=12)
+ax.set_ylabel("Cumulative OTU richness per nest", fontsize=12)
+
+# Start y-axis at zero.
+ax.set_ylim(bottom=0)
+
+# Add a simple title for the exported panel.
+ax.set_title("Panel B. Cumulative OTU richness at 1.0% threshold", fontsize=13)
+
+# Add legend.
+ax.legend(frameon=False, fontsize=11)
+
+# Apply consistent styling.
+style_axes(ax)
+
+# Tighten layout so labels are not clipped.
+fig.tight_layout()
+
+# Save Panel B as SVG.
+panel_b_fp = plot_dir / "panel_B_cumulative_richness_1pct.svg"
+fig.savefig(panel_b_fp, format="svg", bbox_inches="tight")
+
+# Close the figure.
+plt.close(fig)
+
+# -----------------------------
+# Final console message
+# -----------------------------
+print("Done.")
+print(f"Saved: {panel_a_fp}")
+print(f"Saved: {panel_b_fp}")
