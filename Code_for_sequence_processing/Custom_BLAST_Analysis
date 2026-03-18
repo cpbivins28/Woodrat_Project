@@ -1,0 +1,431 @@
+### Make customblastdb
+#!/bin/bash
+# ============================================================
+# run_custom_blast.sh
+# Build BLAST database and search OTU representative sequences
+# against FUNDIS + Local reference DB (with query coverage output)
+# ============================================================
+
+set -euo pipefail
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+DB_DIR="blast_db"
+INPUT_FASTA="input/my_Sequences_plus_FUNDIS_FINAL.fa"
+QUERY_FASTA="input/taxonomyITS.otus.taxonomy.fa"
+OUT_TSV="output/woodrat_OTUs_vs_customITS_BLAST.tsv"
+
+# ------------------------------------------------------------
+# MAKE DATABASE
+# ------------------------------------------------------------
+echo "============================================================"
+echo "Building BLAST database from $INPUT_FASTA..."
+echo "Output DB directory: $DB_DIR"
+echo "============================================================"
+
+mkdir -p "$DB_DIR"
+makeblastdb -in "$INPUT_FASTA" -dbtype nucl -out "$DB_DIR/custom_ITS_db"
+
+# ------------------------------------------------------------
+# RUN BLAST (MEGABLAST MODE)
+# ------------------------------------------------------------
+echo ""
+echo "Running BLAST search..."
+blastn \
+  -query "$QUERY_FASTA" \
+  -db "$DB_DIR/custom_ITS_db" \
+  -task megablast \
+  -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send qcovs evalue bitscore" \
+  -evalue 1e-20 \
+  -max_target_seqs 1 \
+  -num_threads 4 \
+  -out "$OUT_TSV"
+
+# ------------------------------------------------------------
+# DONE
+# ------------------------------------------------------------
+echo ""
+echo "✅ BLAST complete."
+echo "Results saved to: $(realpath "$OUT_TSV")"
+echo "============================================================"
+echo "Columns in output:"
+echo "qseqid | sseqid | pident | length | mismatch | gapopen | qstart | qend | sstart | send | qcovs | evalue | bitscore"
+echo "============================================================"
+
+
+
+
+
+###### Summarize voucher matches
+
+#!/usr/bin/env python3
+import os
+import re
+import pandas as pd
+
+# ============================================================
+# Paths
+# ============================================================
+base = "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Figure_4/custom_blast"
+blast_tsv = f"{base}/output/woodrat_OTUs_vs_customITS_BLAST.tsv"
+out_csv = f"{base}/output/voucher_match_summary_all_thresholds.csv"
+
+# ============================================================
+# Load BLAST results
+# ============================================================
+cols = [
+    "qseqid","sseqid","pident","length","mismatch","gapopen",
+    "qstart","qend","sstart","send","qcovs","evalue","bitscore"
+]
+
+df = pd.read_csv(blast_tsv, sep="\t", header=None, names=cols)
+
+# Only hits with 100% query coverage
+df = df[df["qcovs"] == 100]
+
+# ============================================================
+# Helper: Identify FUNDIS vs Local
+# ============================================================
+uuid_pattern = re.compile(r"^[0-9a-f\-]{36}$")
+
+def classify_source(sseqid):
+    header = sseqid.split()[0]
+    if uuid_pattern.fullmatch(header):
+        return "FUNDIS"
+    if any(c.isupper() for c in header):
+        return "Local"
+    # If something unexpected appears, classify as Unknown.
+    return "Unknown"
+
+df["Source"] = df["sseqid"].apply(classify_source)
+
+# ============================================================
+# Identity bins (mutually exclusive)
+# ============================================================
+def identity_bin(pid):
+    if 97.0 <= pid < 98.0:
+        return "97–98"
+    elif 98.0 <= pid < 99.0:
+        return "98–99"
+    elif 99.0 <= pid < 100.0:
+        return "99–100"
+    elif pid == 100.0:
+        return "100"
+    else:
+        return None  # below 97%
+
+df["Identity_Range"] = df["pident"].apply(identity_bin)
+
+# Filter out <97% identity
+df = df.dropna(subset=["Identity_Range"])
+
+# ============================================================
+# Summarize counts
+# ============================================================
+summary = (
+    df.groupby(["Identity_Range", "Source"])
+      .size()
+      .unstack(fill_value=0)
+      .reset_index()
+)
+
+# Ensure both columns exist
+for col in ["FUNDIS", "Local"]:
+    if col not in summary.columns:
+        summary[col] = 0
+
+# Order rows logically
+desired_order = ["97–98", "98–99", "99–100", "100"]
+summary["order"] = summary["Identity_Range"].apply(lambda x: desired_order.index(x))
+summary = summary.sort_values("order").drop(columns="order")
+
+# ============================================================
+# Write output
+# ============================================================
+summary.to_csv(out_csv, index=False)
+print("Wrote summary file:")
+print(out_csv)
+
+
+
+########### Code to plot figure 4
+
+
+#!/usr/bin/env python3
+"""
+Figure_4_all_panels_MODERN.py
+Modern unified generator for Fig. 4A, 4B, and 4C.
+
+Inputs:
+  - custom_blast/output/voucher_match_summary_all_thresholds.csv
+  - curated dictionaries for lifestyle, fruitbody, taxonomy updates, and collapse_map
+
+Outputs:
+  - SVGs/Fig_4A.svg
+  - SVGs/Fig_4B_absolute.svg
+  - SVGs/Fig_4B_efficiency.svg
+  - SVGs/Fig_4C.svg
+"""
+
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+# ============================================================
+# File paths
+# ============================================================
+base = "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Figure_4"
+summary_csv = f"{base}/custom_blast/output/voucher_match_summary_all_thresholds.csv"
+outdir = f"{base}/SVGs"
+os.makedirs(outdir, exist_ok=True)
+
+# ============================================================
+# Curated dictionaries copied from your verified script
+# ============================================================
+
+collapse_map = {
+    "OTU953": ["OTU2476"],
+    "OTU18": ["OTU5719", "OTU79", "OTU112", "OTU237",
+              "OTU4095", "OTU5096", "OTU5733", "OTU5871"],
+    "OTU28": ["OTU3378"],
+    "OTU10": ["OTU84", "OTU283", "OTU2161", "OTU3165", "OTU5094", "OTU5386"],
+    "OTU508": ["OTU2167"],
+    "OTU1368": ["OTU1647", "OTU1876", "OTU4897"],
+    "OTU3619": ["OTU4812"],
+    "OTU26": ["OTU39", "OTU116", "OTU394", "OTU3348", "OTU4120", "OTU5829"],
+    "OTU220": ["OTU5357", "OTU6062"],
+    "OTU831": ["OTU3014"],
+    "OTU41": ["OTU908"],
+    "OTU510": ["OTU4696"],
+    "OTU203": ["OTU4478"]
+}
+
+lifestyle_updates = {
+    "OTU1648": "mycoparasite",
+    "OTU79": "ectomycorrhizal",
+    "OTU112": "ectomycorrhizal",
+    "OTU237": "ectomycorrhizal",
+    "OTU4095": "ectomycorrhizal",
+    "OTU5096": "ectomycorrhizal",
+    "OTU5719": "ectomycorrhizal",
+    "OTU5733": "ectomycorrhizal",
+    "OTU5871": "ectomycorrhizal",
+    "OTU46": "ectomycorrhizal",
+    "OTU361": "ectomycorrhizal"
+}
+
+fruitbody_updates = {
+    "OTU18": "gasteroid-hypogeous",
+    "OTU79": "gasteroid-hypogeous",
+    "OTU112": "gasteroid-hypogeous",
+    "OTU237": "gasteroid-hypogeous",
+    "OTU4095": "gasteroid-hypogeous",
+    "OTU5096": "gasteroid-hypogeous",
+    "OTU5719": "gasteroid-hypogeous",
+    "OTU5733": "gasteroid-hypogeous",
+    "OTU5871": "gasteroid-hypogeous",
+    "OTU437": "gasteroid-hypogeous",
+    "OTU474": "gasteroid-hypogeous",
+    "OTU1133": "gasteroid-hypogeous",
+    "OTU808": "gasteroid-hypogeous",
+    "OTU4539": "gasteroid-hypogeous",
+    "OTU361": "apothecium_(hymenium_on_surface)",
+    "OTU556": "apothecium_(hymenium_on_surface)",
+    "OTU831": "gasteroid-hypogeous",
+    "OTU3014": "gasteroid-hypogeous"
+}
+
+taxonomy_updates = {
+    "OTU82":  {"Genus": None, "Species": "Amanita constricta"},
+    "OTU953": {"Genus": None, "Species": "Inocybe geophylla"},
+    "OTU1648": {"Genus": None, "Species": "Entoloma undatum"},
+    "OTU2114": {"Genus": None, "Species": "Cortinarius sp. ca01"},
+    "OTU2130": {"Genus": None, "Species": "Cortinarius vellingae"},
+    "OTU2476": {"Genus": None, "Species": "Inocybe geophylla"},
+    "OTU2766": {"Genus": None, "Species": "Phlegmacium affabile"},
+    "OTU3200": {"Genus": None, "Species": "Laccaria proxima"},
+    "OTU10": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU18": {"Genus": None, "Species": "Xerocomellus behrii"},
+    "OTU84": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU283": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU2161": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU3165": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU5094": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU5386": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU79": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU112": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU237": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU4095": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5096": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5719": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5733": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5871": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU437": {"Genus": None, "Species": None},
+    "OTU474": {"Genus": None, "Species": "Rhizopogon sp. ca06"},
+    "OTU1133": {"Genus": None, "Species": "Rhizopogon sp. ca07"},
+    "OTU2167": {"Genus": None, "Species": "Astraeus pteridis"},
+    "OTU3883": {"Genus": "Melanogaster", "Species": "Alpova trappei"},
+    "OTU3619": {"Genus": None, "Species": "Hysterangium sp. ca07"},
+    "OTU26": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU39": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU116": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU394": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU3348": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU4120": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU5829": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU46": {"Genus": None, "Species": "Peziza ellipsospora"},
+    "OTU361": {"Genus": None, "Species": "Ionopeziza sp. ca01"},
+    "OTU637": {"Genus": None, "Species": "Genea af harknessii"},
+    "OTU831": {"Genus": None, "Species": "Geopora cooperi"},
+    "OTU3014": {"Genus": None, "Species": "Geopora cooperi"},
+    "OTU220": {"Genus": None, "Species": "Tuber sp. SOC1404"},
+    "OTU5357": {"Genus": None, "Species": "Tuber sp. SOC1404"},
+    "OTU6062": {"Genus": None, "Species": "Tuber sp. SOC1404"},
+    "OTU3183": {"Genus": None, "Species": "Leucophleps spinispora"},
+    "OTU41": {"Genus": None, "Species": "Russula sp. CA10"},
+    "OTU238": {"Genus": None, "Species": "Russula grundii"},
+    "OTU510": {"Genus": None, "Species": None},
+    "OTU767": {"Genus": None, "Species": "Lactarius alnicola"},
+    "OTU808": {"Genus": None, "Species": "Lactarius af. Southworthiae"},
+    "OTU835": {"Genus": None, "Species": "Russula cremicolor CA01"},
+    "OTU3152": {"Genus": None, "Species": "Russula sp. CA02"},
+    "OTU4539": {"Genus": None, "Species": "Russula sp. CA23"}
+}
+
+# ============================================================
+# Global plot styling
+# ============================================================
+plt.rcParams.update({
+    "font.family": "Arial",
+    "font.size": 9,
+    "axes.linewidth": 0.8,
+    "savefig.transparent": True,
+    "axes.labelpad": 6
+})
+
+figsize = (6, 3)
+colA_fundis = "#e78ac3"
+colA_local = "#a6d854"
+colB = ["#8da0cb", "#66c2a5"]
+colC = ["#fc8d62", "#ffd92f", "#b3b3b3", "#a6cee3"]
+
+# ============================================================
+# FIGURE 4A
+# ============================================================
+dfA = pd.read_csv(summary_csv)
+fig, ax = plt.subplots(figsize=figsize)
+
+width = 0.35
+x = range(len(dfA))
+
+ax.barh([i - width/2 for i in x], dfA["FUNDIS"], height=width, color=colA_fundis, label="FUNDIS vouchers")
+ax.barh([i + width/2 for i in x], dfA["Local"], height=width, color=colA_local, label="Local vouchers")
+
+for i, (f, l) in enumerate(zip(dfA["FUNDIS"], dfA["Local"])):
+    ax.text(f + 0.5, i - width/2, str(f), va="center", fontsize=8)
+    ax.text(l + 0.5, i + width/2, str(l), va="center", fontsize=8)
+
+ax.set_yticks(list(x))
+ax.set_yticklabels(dfA["Identity_Range"])
+ax.set_xlabel("Number of OTUs")
+ax.set_title("Fig. 4A. Voucher linked OTUs by percent identity", loc="left")
+ax.legend(frameon=False, loc="best")
+
+plt.tight_layout()
+plt.savefig(f"{outdir}/Fig_4A.svg")
+plt.close()
+
+# ============================================================
+# FIGURE 4B
+# ============================================================
+
+# --- Absolute matches ---
+counts = {
+    "FUNDIS vouchers": 32,
+    "Local vouchers": 26
+}
+
+db_sizes = {
+    "FUNDIS vouchers": 2774,
+    "Local vouchers": 494
+}
+
+df_counts = pd.DataFrame(list(counts.items()), columns=["Source", "Matches"])
+fig, ax = plt.subplots(figsize=figsize)
+
+ax.barh(df_counts["Source"], df_counts["Matches"], color=colB)
+
+for i, val in enumerate(df_counts["Matches"]):
+    ax.text(val + 0.5, i, str(val), va="center", fontsize=8)
+
+ax.set_xlabel("Number of OTUs with 100 percent match")
+ax.set_title("Fig. 4B. Absolute voucher matches", loc="left")
+ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+plt.tight_layout()
+plt.savefig(f"{outdir}/Fig_4B_absolute.svg")
+plt.close()
+
+# --- Efficiency ---
+eff_list = []
+for src in counts:
+    eff = counts[src] / db_sizes[src] * 100
+    eff_list.append((src, eff))
+
+df_eff = pd.DataFrame(eff_list, columns=["Source", "Match efficiency percent"])
+fig, ax = plt.subplots(figsize=figsize)
+
+ax.barh(df_eff["Source"], df_eff["Match efficiency percent"], color=colB)
+
+for i, val in enumerate(df_eff["Match efficiency percent"]):
+    ax.text(val + 0.05, i, f"{val:.2f}", va="center", fontsize=8)
+
+ax.set_xlabel("Match efficiency percent")
+ax.set_title("Fig. 4B. Match efficiency by database size", loc="left")
+plt.tight_layout()
+plt.savefig(f"{outdir}/Fig_4B_efficiency.svg")
+plt.close()
+
+# ============================================================
+# FIGURE 4C
+# ============================================================
+
+lifestyle_count = len(lifestyle_updates)
+fruitbody_count = len(fruitbody_updates)
+species_count = sum(1 for v in taxonomy_updates.values() if v["Species"] not in [None, "", "NA"])
+collapse_count = sum(len(v) for v in collapse_map.values())
+
+dfC = pd.DataFrame({
+    "Category": [
+        "Lifestyle updated",
+        "Fruitbody type updated",
+        "Species ID updated",
+        "OTUs collapsed"
+    ],
+    "Count": [
+        lifestyle_count,
+        fruitbody_count,
+        species_count,
+        collapse_count
+    ]
+})
+
+fig, ax = plt.subplots(figsize=figsize)
+ax.barh(dfC["Category"], dfC["Count"], color=colC)
+
+for i, val in enumerate(dfC["Count"]):
+    ax.text(val + 0.3, i, str(val), va="center", fontsize=8)
+
+ax.set_xlabel("Number of OTUs")
+ax.set_title("Fig. 4C. Annotation and taxonomic improvements", loc="left")
+ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+plt.tight_layout()
+plt.savefig(f"{outdir}/Fig_4C.svg")
+plt.close()
+
+print("All Fig. 4 panels written to:", outdir)
+
+
+
