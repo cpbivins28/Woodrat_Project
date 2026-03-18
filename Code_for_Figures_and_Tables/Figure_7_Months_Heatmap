@@ -1,0 +1,535 @@
+"""
+Purpose:
+    Create two SVG heatmaps showing monthly detection counts for ECM fungal OTUs
+    in woodrat fecal samples from McKenzie, Year 2, using a 1.0% relative
+    abundance threshold.
+
+Inputs:
+    1) otu_table_collapsed_relative.csv
+    2) guild_table_collapsed_manual_updates.csv
+    3) metadata.csv
+
+Logic:
+    - Restrict samples to McKenzie, Year 2
+    - Exclude November
+    - Define detections as RA >= 1.0%
+    - Define truffle OTUs as ectomycorrhizal + gasteroid-hypogeous
+    - Define epigeous ECM OTUs as ectomycorrhizal + one of:
+        agaricoid, clavarioid, gasteroid, apothecium_(hymenium_on_surface)
+    - Count the number of samples in which each OTU is detected per month
+    - Keep only OTUs detected at least once in any month
+    - Build one heatmap for truffles and one for epigeous ECM
+    - Use a shared color scale across both panels
+    - Annotate nonzero cells with counts
+    - Export each panel separately as SVG
+
+Outputs:
+    1) mckenzie_y2_truffle_month_detection_heatmap_1pct.svg
+    2) mckenzie_y2_epigeous_month_detection_heatmap_1pct.svg
+"""
+
+# --------------------------------------------------
+# Imports
+# --------------------------------------------------
+
+# Import pathlib for robust file handling.
+from pathlib import Path
+
+# Import numpy for numeric work.
+import numpy as np
+
+# Import pandas for table manipulation.
+import pandas as pd
+
+# Import matplotlib for plotting.
+import matplotlib.pyplot as plt
+
+# Import colormap tools for custom white-to-color gradients.
+from matplotlib.colors import LinearSegmentedColormap
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+
+# Define the project working-data directory.
+base_dir = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data")
+
+# Define the OTU relative-abundance table path.
+otu_fp = base_dir / "otu_table_collapsed_relative.csv"
+
+# Define the curated guild table path.
+# If your current file is named differently, change only this line.
+guild_fp = base_dir / "guild_table_collapsed.csv"
+
+# Define the metadata table path.
+meta_fp = base_dir / "metadata.csv"
+
+# Define the output directory for the heatmaps.
+out_dir = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_y2_monthly_heatmaps")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+# --------------------------------------------------
+# User-defined settings
+# --------------------------------------------------
+
+# Define the focal site.
+keep_site = "Mckenzie"
+
+# Define the focal year.
+keep_year = 2
+
+# Define the month order to retain and plot.
+month_order = ["December", "January", "February", "March", "April"]
+
+# Define abbreviated month labels for the x-axis.
+month_labels = ["Dec", "Jan", "Feb", "Mar", "Apr"]
+
+# Define the relative-abundance threshold.
+threshold = 1.0
+
+# Define the fruitbody morphologies used for epigeous ECM.
+epigeous_morphologies = {
+    "agaricoid",
+    "gasteroid",
+    "clavarioid",
+    "apothecium_(hymenium_on_surface)"
+}
+
+# Define genera to exclude explicitly from the epigeous panel.
+excluded_epigeous_genera = {"Pulvinula", "Geopora"}
+
+# Define output filenames.
+truffle_svg_fp = out_dir / "mckenzie_y2_truffle_month_detection_heatmap_1pct.svg"
+epigeous_svg_fp = out_dir / "mckenzie_y2_epigeous_month_detection_heatmap_1pct.svg"
+
+# --------------------------------------------------
+# Helper functions
+# --------------------------------------------------
+
+def require_columns(df: pd.DataFrame, required: set, table_name: str) -> None:
+    """Raise an error if required columns are missing."""
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{table_name} is missing required columns: {sorted(missing)}")
+
+
+def make_taxon_display(genus: str, species: str) -> str:
+    """
+    Build a single taxon display string.
+    If species is missing, return 'Genus sp.'.
+    If species already includes the genus, use it as is.
+    """
+    genus = "" if pd.isna(genus) else str(genus).strip()
+    species = "" if pd.isna(species) else str(species).strip()
+
+    # Handle missing or uninformative species strings.
+    if species == "" or species.lower() in {"sp", "sp.", "nan", "na"}:
+        if genus:
+            return f"{genus} sp."
+        return "Unidentified sp."
+
+    # If species already contains the genus as the first word, keep it.
+    species_words = species.split()
+    if genus and len(species_words) > 0 and species_words[0] == genus:
+        return species
+
+    # Otherwise combine genus and species.
+    if genus:
+        return f"{genus} {species}"
+
+    return species
+
+
+def mathtext_italic_label(taxon: str, otu_id: str) -> str:
+    """
+    Build a y-axis label with italicized taxon name and plain OTU ID.
+    Uses matplotlib mathtext.
+    """
+    # Escape spaces for mathtext italics.
+    italic_taxon = taxon.replace(" ", r"\ ")
+    return rf"$\it{{{italic_taxon}}}$ ({otu_id})"
+
+
+def build_white_to_color_cmap(hex_color: str, cmap_name: str) -> LinearSegmentedColormap:
+    """Create a simple sequential colormap from white to a target color."""
+    return LinearSegmentedColormap.from_list(cmap_name, ["#FFFFFF", hex_color])
+
+
+def plot_heatmap(
+    data_df: pd.DataFrame,
+    title: str,
+    cmap: LinearSegmentedColormap,
+    vmax: int,
+    output_fp: Path
+) -> None:
+    """
+    Plot and save a monthly OTU detection-count heatmap.
+
+    Parameters:
+        data_df: DataFrame with OTUs as rows and months as columns.
+        title: Panel title.
+        cmap: Colormap for the panel.
+        vmax: Shared maximum color scale across panels.
+        output_fp: SVG output path.
+    """
+    # Convert the dataframe to a numeric matrix for plotting.
+    matrix = data_df.to_numpy(dtype=float)
+
+    # Get the number of rows and columns.
+    n_rows, n_cols = matrix.shape
+
+    # Set figure height dynamically so labels remain readable.
+    # Use a minimum height for small panels and scale upward for larger panels.
+    fig_height = max(4.0, 0.32 * n_rows + 1.3)
+
+    # Create the figure and axis.
+    fig, ax = plt.subplots(figsize=(6.8, fig_height))
+
+    # Draw the heatmap with square-ish cells and consistent scaling.
+    im = ax.imshow(
+        matrix,
+        cmap=cmap,
+        vmin=0,
+        vmax=vmax,
+        aspect="auto",
+        interpolation="none"
+    )
+
+    # Set x-axis ticks and labels.
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(month_labels, fontsize=11)
+
+    # Move x-axis labels to the top.
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position("top")
+
+    # Remove tick marks.
+    ax.tick_params(axis="x", which="both", length=0)
+    ax.tick_params(axis="y", which="both", length=0)
+
+    # Set y-axis ticks and italicized OTU labels.
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels(data_df.index.tolist(), fontsize=9)
+
+    # Add thin light-gray cell boundaries using minor-grid lines.
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="#D9D9D9", linestyle="-", linewidth=0.6)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    # Remove the outer spines for a cleaner look.
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    # Annotate only nonzero cells.
+    for i in range(n_rows):
+        for j in range(n_cols):
+            value = int(matrix[i, j])
+
+            # Leave zero cells blank.
+            if value == 0:
+                continue
+
+            # Choose annotation color based on background intensity.
+            # Use white text in darker cells and black text otherwise.
+            text_color = "white" if value >= max(1, int(np.ceil(vmax * 0.55))) else "black"
+
+            # Add the count annotation.
+            ax.text(
+                j,
+                i,
+                str(value),
+                ha="center",
+                va="center",
+                fontsize=9,
+                color=text_color
+            )
+
+    # Add the panel title.
+    ax.set_title(title, fontsize=12, pad=12)
+
+    # Tighten layout to reduce clipping.
+    fig.tight_layout()
+
+    # Save as SVG.
+    fig.savefig(output_fp, format="svg", bbox_inches="tight")
+
+    # Close the figure to avoid carryover.
+    plt.close(fig)
+
+
+# --------------------------------------------------
+# Load input tables
+# --------------------------------------------------
+
+# Read the OTU table.
+otu = pd.read_csv(otu_fp)
+
+# Read the guild table.
+guild = pd.read_csv(guild_fp)
+
+# Read the metadata table.
+meta = pd.read_csv(meta_fp)
+
+# --------------------------------------------------
+# Validate required columns
+# --------------------------------------------------
+
+# Check OTU table structure.
+require_columns(otu, {"OTU_ID"}, "OTU table")
+
+# Check guild table structure.
+require_columns(
+    guild,
+    {"OTU_ID", "Genus", "Species", "primary_lifestyle", "Fruitbody_type_template"},
+    "Guild table"
+)
+
+# Check metadata structure.
+require_columns(
+    meta,
+    {"Sample_ID", "Site", "Year", "Month"},
+    "Metadata table"
+)
+
+# --------------------------------------------------
+# Restrict metadata to McKenzie Year 2 and focal months
+# --------------------------------------------------
+
+# Keep only McKenzie Year 2 samples in December-April.
+meta_sub = meta.loc[
+    (meta["Site"] == keep_site) &
+    (pd.to_numeric(meta["Year"], errors="coerce") == keep_year) &
+    (meta["Month"].isin(month_order)),
+    ["Sample_ID", "Month"]
+].copy()
+
+# Stop if no samples remain after filtering.
+if meta_sub.empty:
+    raise ValueError("No metadata rows remained after filtering to McKenzie Year 2, December-April.")
+
+# Make Month an ordered categorical to preserve plotting order.
+meta_sub["Month"] = pd.Categorical(meta_sub["Month"], categories=month_order, ordered=True)
+
+# Extract the retained sample IDs.
+keep_samples = meta_sub["Sample_ID"].tolist()
+
+# --------------------------------------------------
+# Define truffle and epigeous ECM OTU sets
+# --------------------------------------------------
+
+# Make a defensive copy of the guild table.
+guild_sub = guild.copy()
+
+# Normalize text columns to strings for safe filtering.
+guild_sub["primary_lifestyle"] = guild_sub["primary_lifestyle"].astype(str)
+guild_sub["Fruitbody_type_template"] = guild_sub["Fruitbody_type_template"].astype(str)
+guild_sub["Genus"] = guild_sub["Genus"].fillna("").astype(str)
+guild_sub["Species"] = guild_sub["Species"].fillna("").astype(str)
+
+# Define truffle OTUs exactly as ectomycorrhizal + gasteroid-hypogeous.
+truffle_tax = guild_sub.loc[
+    (guild_sub["primary_lifestyle"] == "ectomycorrhizal") &
+    (guild_sub["Fruitbody_type_template"] == "gasteroid-hypogeous")
+].copy()
+
+# Define epigeous ECM OTUs as requested, excluding Pulvinula and Geopora explicitly.
+epigeous_tax = guild_sub.loc[
+    (guild_sub["primary_lifestyle"] == "ectomycorrhizal") &
+    (guild_sub["Fruitbody_type_template"].isin(epigeous_morphologies)) &
+    (~guild_sub["Genus"].isin(excluded_epigeous_genera))
+].copy()
+
+# Extract OTU ID sets.
+truffle_ids = set(truffle_tax["OTU_ID"].astype(str))
+epigeous_ids = set(epigeous_tax["OTU_ID"].astype(str))
+
+# --------------------------------------------------
+# Reshape OTU table to long format for retained samples
+# --------------------------------------------------
+
+# Identify sample columns present in both OTU table and filtered metadata.
+otu_sample_cols = [col for col in otu.columns if col != "OTU_ID" and col in keep_samples]
+
+# Stop if no overlapping samples are found.
+if len(otu_sample_cols) == 0:
+    raise ValueError("No McKenzie Year 2 sample IDs from metadata were found in the OTU table.")
+
+# Keep OTU_ID and the retained sample columns.
+otu_sub = otu[["OTU_ID"] + otu_sample_cols].copy()
+
+# Convert OTU IDs to string for consistent joins.
+otu_sub["OTU_ID"] = otu_sub["OTU_ID"].astype(str)
+
+# Pivot to long format.
+otu_long = otu_sub.melt(
+    id_vars="OTU_ID",
+    var_name="Sample_ID",
+    value_name="RA"
+)
+
+# Replace missing RA with zero.
+otu_long["RA"] = pd.to_numeric(otu_long["RA"], errors="coerce").fillna(0)
+
+# Join month metadata.
+otu_long = otu_long.merge(meta_sub, on="Sample_ID", how="left")
+
+# Stop if the merge failed unexpectedly.
+if otu_long["Month"].isna().any():
+    raise ValueError("Some retained OTU rows did not match filtered metadata by Sample_ID.")
+
+# --------------------------------------------------
+# Attach guild identity and taxonomy
+# --------------------------------------------------
+
+# Build a focal taxonomy table containing both guilds.
+focal_tax = pd.concat([
+    truffle_tax.assign(Guild="Truffle"),
+    epigeous_tax.assign(Guild="Epigeous_ECM")
+], ignore_index=True)
+
+# Keep one row per OTU.
+focal_tax = focal_tax[["OTU_ID", "Genus", "Species", "Guild"]].drop_duplicates().copy()
+
+# Convert OTU IDs to string for consistency.
+focal_tax["OTU_ID"] = focal_tax["OTU_ID"].astype(str)
+
+# Join focal taxonomy onto the long OTU table.
+otu_long = otu_long.merge(focal_tax, on="OTU_ID", how="inner")
+
+# --------------------------------------------------
+# Apply the 1.0% detection threshold
+# --------------------------------------------------
+
+# Mark detections at or above the threshold.
+otu_long["Detected"] = otu_long["RA"] >= threshold
+
+# Keep only detected rows.
+detected_long = otu_long.loc[otu_long["Detected"]].copy()
+
+# Stop with a clear error if nothing passes.
+if detected_long.empty:
+    raise ValueError("No OTUs met the 1.0% threshold in McKenzie Year 2 December-April samples.")
+
+# --------------------------------------------------
+# Count detections by OTU and month
+# --------------------------------------------------
+
+# Count the number of samples in which each OTU is detected in each month.
+counts = (
+    detected_long
+    .groupby(["Guild", "OTU_ID", "Genus", "Species", "Month"], observed=False)
+    .size()
+    .reset_index(name="Detection_Count")
+)
+
+# --------------------------------------------------
+# Build taxon labels
+# --------------------------------------------------
+
+# Build a plain taxon string for sorting.
+counts["Taxon"] = counts.apply(
+    lambda row: make_taxon_display(row["Genus"], row["Species"]),
+    axis=1
+)
+
+# Build the final plotted row label with italicized taxon name and OTU ID.
+counts["Row_Label"] = counts.apply(
+    lambda row: mathtext_italic_label(row["Taxon"], row["OTU_ID"]),
+    axis=1
+)
+
+# --------------------------------------------------
+# Pivot separately for truffles and epigeous ECM
+# --------------------------------------------------
+
+# Helper function to build a month-by-OTU matrix for a given guild.
+def build_matrix_for_guild(counts_df: pd.DataFrame, guild_name: str) -> pd.DataFrame:
+    """Build a heatmap-ready OTU x month matrix for one guild."""
+    # Keep the focal guild only.
+    sub = counts_df.loc[counts_df["Guild"] == guild_name].copy()
+
+    # Pivot so rows are OTUs and columns are months.
+    mat = sub.pivot_table(
+        index="Row_Label",
+        columns="Month",
+        values="Detection_Count",
+        aggfunc="sum",
+        fill_value=0
+    )
+
+    # Ensure exact month order.
+    mat = mat.reindex(columns=month_order, fill_value=0)
+
+    # Compute row totals for sorting.
+    row_totals = mat.sum(axis=1)
+
+    # Sort OTUs by total detections descending, then alphabetically.
+    sorted_index = sorted(
+        mat.index.tolist(),
+        key=lambda x: (-row_totals.loc[x], x)
+    )
+    mat = mat.loc[sorted_index]
+
+    return mat
+
+# Build matrices for each guild.
+truffle_mat = build_matrix_for_guild(counts, "Truffle")
+epigeous_mat = build_matrix_for_guild(counts, "Epigeous_ECM")
+
+# --------------------------------------------------
+# Determine shared color scale
+# --------------------------------------------------
+
+# Find the maximum detection count across both panels.
+shared_vmax = int(
+    max(
+        truffle_mat.to_numpy().max() if not truffle_mat.empty else 0,
+        epigeous_mat.to_numpy().max() if not epigeous_mat.empty else 0
+    )
+)
+
+# Stop if the matrices are somehow empty after filtering.
+if shared_vmax == 0:
+    raise ValueError("All heatmap values are zero after filtering; nothing to plot.")
+
+# --------------------------------------------------
+# Define colormaps
+# --------------------------------------------------
+
+# Create the truffle white-to-dark-green colormap.
+truffle_cmap = build_white_to_color_cmap("#1B7837", "white_to_dark_green")
+
+# Create the epigeous white-to-dark-orange colormap.
+epigeous_cmap = build_white_to_color_cmap("#B35806", "white_to_dark_orange")
+
+# --------------------------------------------------
+# Plot and save the two panels
+# --------------------------------------------------
+
+# Plot the truffle panel.
+plot_heatmap(
+    data_df=truffle_mat,
+    title="(a) Truffles",
+    cmap=truffle_cmap,
+    vmax=shared_vmax,
+    output_fp=truffle_svg_fp
+)
+
+# Plot the epigeous ECM panel.
+plot_heatmap(
+    data_df=epigeous_mat,
+    title="(b) Epigeous ECM",
+    cmap=epigeous_cmap,
+    vmax=shared_vmax,
+    output_fp=epigeous_svg_fp
+)
+
+# --------------------------------------------------
+# Final messages
+# --------------------------------------------------
+
+print("Done.")
+print(f"Saved: {truffle_svg_fp}")
+print(f"Saved: {epigeous_svg_fp}")
+print(f"Shared vmax across panels: {shared_vmax}")
