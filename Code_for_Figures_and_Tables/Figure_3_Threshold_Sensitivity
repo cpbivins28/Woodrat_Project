@@ -1,0 +1,251 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Woodrat Project — Detection Threshold Analysis (Global, FINAL)
+# ============================================================
+# Computes detection metrics (richness, mean detections per sample,
+# and number of samples with detections) across multiple relative-
+# abundance thresholds for Truffle and Epigeous ECM fungi.
+#
+# Correctly treats 0.0 threshold as "any non-zero detection"
+# (0 = absent, >0 = present).
+#
+# Inputs:
+#   guild_table_collapsed.csv
+#   otu_table_collapsed_relative.csv
+#
+# Output:
+#   threshold_summary_global.csv
+#
+# Author: C. Bivins
+# Date: 2025-11-09
+# ============================================================
+
+library(tidyverse)
+
+# ------------------------------------------------------------
+# 1. Define file paths
+# ------------------------------------------------------------
+guild_path  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+otu_path    <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+output_path <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Figure_5/threshold_summary_global.csv"
+
+# ------------------------------------------------------------
+# 2. Load data and ensure numeric columns
+# ------------------------------------------------------------
+guild <- read_csv(guild_path, show_col_types = FALSE)
+
+otu <- read_csv(otu_path, show_col_types = FALSE) %>%
+  mutate(across(-OTU_ID, ~ suppressWarnings(as.numeric(as.character(.)))))
+
+cat("\nColumn type summary (should all be numeric):\n")
+print(table(sapply(otu[-1], class)))
+
+# ------------------------------------------------------------
+# 3. Identify OTUs by guild (case-insensitive)
+# ------------------------------------------------------------
+guild <- guild %>%
+  mutate(
+    primary_lifestyle = str_to_lower(primary_lifestyle),
+    Fruitbody_type_template = str_to_lower(Fruitbody_type_template)
+  )
+
+truffle_ids <- guild %>%
+  filter(primary_lifestyle == "ectomycorrhizal",
+         Fruitbody_type_template == "gasteroid-hypogeous") %>%
+  pull(OTU_ID) %>%
+  unique()
+
+epigeous_ids <- guild %>%
+  filter(primary_lifestyle == "ectomycorrhizal",
+         Fruitbody_type_template %in%
+           c("agaricoid", "gasteroid", "clavarioid",
+             "apothecium_(hymenium_on_surface)")) %>%
+  pull(OTU_ID) %>%
+  unique()
+
+cat("\nOTU counts by guild:\n")
+cat("  Truffle OTUs:", length(truffle_ids), "\n")
+cat("  Epigeous ECM OTUs:", length(epigeous_ids), "\n")
+
+if (length(truffle_ids) == 0 | length(epigeous_ids) == 0) {
+  stop("ERROR: No OTUs matched the truffle or epigeous ECM filters.")
+}
+
+# ------------------------------------------------------------
+# 4. Metric computation (zeros treated as absent)
+# ------------------------------------------------------------
+compute_threshold_metrics <- function(otu_df, ids, threshold) {
+
+  sub_df <- otu_df %>%
+    filter(OTU_ID %in% ids) %>%
+    arrange(factor(OTU_ID, levels = ids))
+
+  if (nrow(sub_df) == 0) {
+    return(tibble(
+      n_OTUs_detected = 0,
+      mean_OTUs_per_sample = NA,
+      n_samples_detected = 0
+    ))
+  }
+
+  sub_mat <- as.matrix(sub_df[, -1, drop = FALSE])
+
+  # Presence logic: zeros = absent
+  present <- if (threshold == 0) {
+    sub_mat > 0        # strictly greater than zero
+  } else {
+    sub_mat >= threshold
+  }
+
+  n_OTUs_detected <- sum(rowSums(present, na.rm = TRUE) > 0, na.rm = TRUE)
+  mean_OTUs_per_sample <- mean(colSums(present, na.rm = TRUE), na.rm = TRUE)
+  n_samples_detected <- sum(colSums(present, na.rm = TRUE) > 0, na.rm = TRUE)
+
+  tibble(
+    n_OTUs_detected = n_OTUs_detected,
+    mean_OTUs_per_sample = mean_OTUs_per_sample,
+    n_samples_detected = n_samples_detected
+  )
+}
+
+# ------------------------------------------------------------
+# 5. Define thresholds and guilds
+# ------------------------------------------------------------
+thresholds <- c(0, 0.2, 0.5, 1.0, 1.5)   # percent relative abundance
+guilds <- c("Truffle", "Epigeous_ECM")
+
+# ------------------------------------------------------------
+# 6. Compute metrics for all thresholds
+# ------------------------------------------------------------
+results <- expand_grid(guild = guilds, threshold = thresholds) %>%
+  mutate(metrics = map2(guild, threshold, ~{
+    ids <- if (.x == "Truffle") truffle_ids else epigeous_ids
+    compute_threshold_metrics(otu, ids, .y)
+  })) %>%
+  unnest(metrics)
+
+# ------------------------------------------------------------
+# 7. Write output CSV
+# ------------------------------------------------------------
+write_csv(results, output_path)
+cat("\nThreshold summary saved to:\n", output_path, "\n")
+
+# ------------------------------------------------------------
+# 8. Diagnostic printout
+# ------------------------------------------------------------
+for (g in guilds) {
+  tmp <- results %>% filter(guild == g)
+  cat("\n---", g, "---\n")
+  print(tmp)
+}
+
+
+
+########################################################################
+
+##### Code to make Figure 3
+
+
+#!/usr/bin/env python3
+# ============================================================
+# Woodrat Project — Figure 5 (All Panels A–D, Exported Separately)
+# ============================================================
+# Panels:
+#   A. OTU richness vs. threshold
+#   B. Sample detections vs. threshold
+#
+# Each saved as a separate high-res SVG
+# ============================================================
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import numpy as np
+
+# ------------------------------------------------------------
+# File paths
+# ------------------------------------------------------------
+base_dir = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Figure_5")
+input_path = base_dir / "threshold_summary_global.csv"
+
+# ------------------------------------------------------------
+# Load and prepare data
+# ------------------------------------------------------------
+df = pd.read_csv(input_path)
+df["guild"] = pd.Categorical(df["guild"], categories=["Truffle", "Epigeous_ECM"], ordered=True)
+df["mean_samples_per_OTU"] = df["n_samples_detected"] / df["n_OTUs_detected"]
+
+# ------------------------------------------------------------
+# Styling
+# ------------------------------------------------------------
+sns.set(style="white", context="talk")
+palette = sns.color_palette("Set2", 2)
+x_ticks = np.array([0.0, 0.2, 0.5, 1.0, 1.5])
+
+def clean_axis(ax, xlabel, ylabel, title):
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(False)
+    return ax
+
+# ============================================================
+# PANEL A — Richness
+# ============================================================
+fig, ax = plt.subplots(figsize=(6, 5))
+sns.lineplot(
+    data=df,
+    x="threshold",
+    y="n_OTUs_detected",
+    hue="guild",
+    marker="o",
+    linewidth=2.2,
+    palette=palette,
+    ax=ax
+)
+ax.set_xticks(x_ticks)
+clean_axis(ax, "Relative abundance threshold (%)", "Number of OTUs detected", "A. OTU richness vs threshold")
+ax.legend(title="Guild", loc="upper right", frameon=False)
+plt.tight_layout()
+fig.savefig(base_dir / "Figure_5A_OTU_richness.svg", dpi=300)
+plt.close(fig)
+
+# ============================================================
+# PANEL B — Detection frequency
+# ============================================================
+fig, ax = plt.subplots(figsize=(6, 5))
+sns.lineplot(
+    data=df,
+    x="threshold",
+    y="n_samples_detected",
+    hue="guild",
+    marker="o",
+    linewidth=2.2,
+    palette=palette,
+    ax=ax
+)
+ax.set_xticks(x_ticks)
+clean_axis(ax, "Relative abundance threshold (%)", "Number of samples with detections", "B. Sample detections vs threshold")
+ax.legend(title="Guild", loc="upper right", frameon=False)
+plt.tight_layout()
+fig.savefig(base_dir / "Figure_5B_Sample_detections.svg", dpi=300)
+plt.close(fig)
+
+# ------------------------------------------------------------
+# Summary message
+# ------------------------------------------------------------
+print("\n✅ All panels exported successfully:")
+print(" - Figure_5A_OTU_richness.svg")
+print(" - Figure_5B_Sample_detections.svg")
+print(f"\nFiles saved in:\n{base_dir}\n")
+
+
+
+
+
+
+
