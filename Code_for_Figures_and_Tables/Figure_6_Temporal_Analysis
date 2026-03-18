@@ -1,0 +1,2341 @@
+```{r}
+################################################################################
+# PURPOSE:
+#   Unified H3 + H4 script for McKenzie temporal heterogeneity across months.
+#
+#   This script:
+#     1) Tests H3 separately at each threshold using the same basic response
+#        structure as H1:
+#          - Detection model: AnyDetected ~ Month + (1 | Nest_ID)
+#          - Richness model:  OTU_Richness ~ Month + (1 | Nest_ID)
+#     2) Falls back to fixed-effect Nest_ID models when mixed models are
+#        singular, fail to converge, or otherwise fit poorly.
+#     3) Repeats the analysis across thresholds to explicitly evaluate H4
+#        robustness.
+#     4) Exports 1.0% threshold outputs for plotting and biological description.
+#     5) Exports 1.0% OTU-level monthly summaries to identify which taxa drive
+#        the temporal pattern.
+#
+# INPUTS:
+#   1) otu_table_collapsed_relative.csv
+#   2) guild_table_collapsed.csv
+#   3) metadata.csv
+#
+# THRESHOLDS:
+#   - 0.0  -> interpreted as RA > 0
+#   - 0.2  -> interpreted as RA >= 0.2
+#   - 0.5  -> interpreted as RA >= 0.5
+#   - 1.0  -> interpreted as RA >= 1.0
+#   - 1.5  -> interpreted as RA >= 1.5
+#
+# FOCAL DATA SUBSET:
+#   - Site: Mckenzie
+#   - Year: 2
+#   - Months retained: December, January, February, March, April
+#   - November omitted explicitly
+#   - Focal nests: M1, M3, M6, M8, M9, M10
+#
+# FOCAL GUILDS:
+#   - Truffle
+#   - Epigeous_ECM
+#
+# MAIN OUTPUT GROUPS:
+#   A) Combined sample- and month-level summary tables across all thresholds
+#   B) Per-threshold model outputs for detection and richness
+#   C) Combined robustness summary table across thresholds
+#   D) Dedicated 1.0% plotting tables
+#   E) Dedicated 1.0% OTU-level interpretation tables
+#
+# NOTES:
+#   - Relative abundance values are percentages summing to ~100 per sample.
+#   - Month is treated as a categorical factor with fixed order:
+#       December, January, February, March, April
+#   - Mixed models are attempted first using Nest_ID as a random intercept.
+#   - If mixed models are singular, fail to converge, or error out, the script
+#     falls back to fixed-effect Nest_ID models.
+#   - Richness models use Poisson first, then negative binomial if
+#     overdispersion is high, mirroring H1 logic.
+################################################################################
+
+# --------------------------------------------------
+# Libraries
+# --------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(readr)
+library(broom)
+library(broom.mixed)
+library(tibble)
+library(MASS)
+library(lme4)
+
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_h2_h4_temporal"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+thresholds <- c(0.0, 0.2, 0.5, 1.0, 1.5)
+plot_threshold <- 1.0
+
+keep_site   <- "Mckenzie"
+keep_year   <- 2
+keep_nests  <- c("M1", "M3", "M6", "M8", "M9", "M10")
+keep_months <- c("December", "January", "February", "March", "April")
+
+# --------------------------------------------------
+# Helper function: threshold label for filenames
+# --------------------------------------------------
+threshold_label <- function(x) {
+  if (x == 0) return("0pct")
+  out <- gsub("\\.", "p", as.character(x))
+  paste0(out, "pct")
+}
+
+# --------------------------------------------------
+# Helper function: safely collect model warnings
+# --------------------------------------------------
+fit_with_warnings <- function(expr) {
+  warning_messages <- character(0)
+
+  fit <- withCallingHandlers(
+    tryCatch(
+      expr,
+      error = function(e) e
+    ),
+    warning = function(w) {
+      warning_messages <<- c(warning_messages, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  list(
+    fit = fit,
+    warnings = unique(warning_messages)
+  )
+}
+
+# --------------------------------------------------
+# Helper function: detect problematic mixed model fit
+# --------------------------------------------------
+mixed_model_problem <- function(model, warnings_vec = character(0)) {
+
+  if (inherits(model, "error")) {
+    return(TRUE)
+  }
+
+  if (!inherits(model, "merMod")) {
+    return(TRUE)
+  }
+
+  # Check singularity for mixed models.
+  singular_flag <- FALSE
+  singular_flag <- tryCatch(
+    lme4::isSingular(model, tol = 1e-4),
+    error = function(e) FALSE
+  )
+
+  # Check optimizer / convergence messages.
+  conv_messages <- character(0)
+  conv_messages <- tryCatch(
+    unlist(model@optinfo$conv$lme4$messages),
+    error = function(e) character(0)
+  )
+
+  # Flag warnings that indicate major fit issues.
+  bad_warning_patterns <- c(
+    "failed to converge",
+    "degenerate",
+    "singular",
+    "non-positive-definite",
+    "unable to evaluate scaled gradient",
+    "Model failed to converge",
+    "boundary \\(singular\\) fit"
+  )
+
+  has_bad_warning <- FALSE
+  if (length(warnings_vec) > 0 || length(conv_messages) > 0) {
+    all_msgs <- c(warnings_vec, conv_messages)
+    has_bad_warning <- any(
+      grepl(
+        paste(bad_warning_patterns, collapse = "|"),
+        all_msgs,
+        ignore.case = TRUE
+      )
+    )
+  }
+
+  return(isTRUE(singular_flag) || has_bad_warning)
+}
+
+# --------------------------------------------------
+# Helper function: compute overdispersion ratio
+# --------------------------------------------------
+overdispersion_ratio <- function(model) {
+
+  # Handle standard GLM objects.
+  if (inherits(model, "glm")) {
+    rp <- residuals(model, type = "pearson")
+    rdf <- df.residual(model)
+
+    if (rdf <= 0) return(NA_real_)
+    return(sum(rp^2, na.rm = TRUE) / rdf)
+  }
+
+  # Handle mixed models approximately.
+  if (inherits(model, "merMod")) {
+    rp <- residuals(model, type = "pearson")
+    n_obs <- nobs(model)
+
+    # Approximate residual df as n - number of fixed effects - 1.
+    # This is imperfect, but is acceptable here as a pragmatic screening rule.
+    n_fixef <- tryCatch(length(lme4::fixef(model)), error = function(e) NA_integer_)
+    rdf <- n_obs - n_fixef - 1
+
+    if (is.na(rdf) || rdf <= 0) return(NA_real_)
+    return(sum(rp^2, na.rm = TRUE) / rdf)
+  }
+
+  return(NA_real_)
+}
+
+# --------------------------------------------------
+# Helper function: extract LRT table from anova(model0, model1)
+# --------------------------------------------------
+extract_lrt_table <- function(lrt_obj, tested_term) {
+
+  tab <- as.data.frame(lrt_obj)
+  tab <- tibble::rownames_to_column(tab, "Model_Row")
+
+  # Keep only the second row, which corresponds to the fuller model.
+  if (nrow(tab) < 2) {
+    stop("LRT table did not contain two rows.")
+  }
+
+  tab2 <- tab[2, , drop = FALSE]
+
+  # Identify p-value column robustly.
+  p_col <- grep("^Pr\\(", names(tab2), value = TRUE)
+  if (length(p_col) != 1) {
+    stop("Could not uniquely identify p-value column in LRT table.")
+  }
+
+  # Identify the test statistic column robustly.
+  stat_col <- NULL
+
+  if ("Chisq" %in% names(tab2)) {
+    stat_col <- "Chisq"
+  } else if ("Deviance" %in% names(tab2)) {
+    stat_col <- "Deviance"
+  } else if ("LR stat." %in% names(tab2)) {
+    stat_col <- "LR stat."
+  } else {
+    chisq_like <- grep("Chisq|Deviance|LR", names(tab2), value = TRUE)
+    chisq_like <- chisq_like[!grepl("^Pr\\(", chisq_like)]
+    if (length(chisq_like) >= 1) {
+      stat_col <- chisq_like[1]
+    }
+  }
+
+  if (is.null(stat_col)) {
+    stop(
+      paste0(
+        "Could not identify test statistic column in LRT table. Columns were: ",
+        paste(names(tab2), collapse = ", ")
+      )
+    )
+  }
+
+  if (!("Df" %in% names(tab2))) {
+    stop("Could not identify Df column in LRT table.")
+  }
+
+  out <- dplyr::transmute(
+    tab2,
+    Term = tested_term,
+    Df = Df,
+    Chisq = .data[[stat_col]],
+    p_value = .data[[p_col]]
+  )
+
+  return(out)
+}
+
+# --------------------------------------------------
+# Helper function: tidy coefficients safely
+# --------------------------------------------------
+tidy_coefficients <- function(model) {
+
+  if (inherits(model, "merMod")) {
+    return(broom.mixed::tidy(model, effects = "fixed"))
+  }
+
+  return(broom::tidy(model))
+}
+
+# --------------------------------------------------
+# Helper function: fit detection model with mixed first, fixed fallback
+# --------------------------------------------------
+fit_detection_model <- function(dat) {
+
+  # Full mixed model with Month effect.
+  full_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      AnyDetected ~ Month + (1 | Nest_ID),
+      family = stats::binomial,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  # Reduced mixed model without Month.
+  red_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      AnyDetected ~ (1 | Nest_ID),
+      family = stats::binomial,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  mixed_ok <- TRUE
+  mixed_ok <- mixed_ok && !inherits(full_mixed_fit$fit, "error")
+  mixed_ok <- mixed_ok && !inherits(red_mixed_fit$fit, "error")
+  mixed_ok <- mixed_ok && !mixed_model_problem(full_mixed_fit$fit, full_mixed_fit$warnings)
+  mixed_ok <- mixed_ok && !mixed_model_problem(red_mixed_fit$fit, red_mixed_fit$warnings)
+
+  if (isTRUE(mixed_ok)) {
+    full_model <- full_mixed_fit$fit
+    reduced_model <- red_mixed_fit$fit
+
+    lrt <- stats::anova(reduced_model, full_model, test = "Chisq")
+    lrt <- extract_lrt_table(lrt, tested_term = "Month")
+
+    return(list(
+      full_model = full_model,
+      reduced_model = reduced_model,
+      lrt_table = lrt,
+      model_type = "mixed_random_intercept",
+      family = "binomial",
+      warnings = unique(c(full_mixed_fit$warnings, red_mixed_fit$warnings))
+    ))
+  }
+
+  # Fixed-effect fallback.
+  full_fixed <- stats::glm(
+    AnyDetected ~ Month + Nest_ID,
+    family = stats::binomial,
+    data = dat
+  )
+
+  reduced_fixed <- stats::glm(
+    AnyDetected ~ Nest_ID,
+    family = stats::binomial,
+    data = dat
+  )
+
+  lrt <- stats::anova(reduced_fixed, full_fixed, test = "Chisq")
+  lrt <- extract_lrt_table(lrt, tested_term = "Month")
+
+  return(list(
+    full_model = full_fixed,
+    reduced_model = reduced_fixed,
+    lrt_table = lrt,
+    model_type = "fixed_effect_nest",
+    family = "binomial",
+    warnings = unique(c(full_mixed_fit$warnings, red_mixed_fit$warnings))
+  ))
+}
+
+# --------------------------------------------------
+# Helper function: fit richness model with mixed first, fixed fallback
+# --------------------------------------------------
+fit_richness_model <- function(dat) {
+
+  # ------------------------------
+  # Try mixed-model Poisson first
+  # ------------------------------
+  full_pois_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      OTU_Richness ~ Month + (1 | Nest_ID),
+      family = stats::poisson,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  red_pois_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      OTU_Richness ~ (1 | Nest_ID),
+      family = stats::poisson,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  pois_mixed_ok <- TRUE
+  pois_mixed_ok <- pois_mixed_ok && !inherits(full_pois_mixed_fit$fit, "error")
+  pois_mixed_ok <- pois_mixed_ok && !inherits(red_pois_mixed_fit$fit, "error")
+  pois_mixed_ok <- pois_mixed_ok && !mixed_model_problem(full_pois_mixed_fit$fit, full_pois_mixed_fit$warnings)
+  pois_mixed_ok <- pois_mixed_ok && !mixed_model_problem(red_pois_mixed_fit$fit, red_pois_mixed_fit$warnings)
+
+  if (isTRUE(pois_mixed_ok)) {
+
+    full_model <- full_pois_mixed_fit$fit
+    reduced_model <- red_pois_mixed_fit$fit
+
+    disp <- overdispersion_ratio(full_model)
+
+    # If overdispersion is modest, keep Poisson mixed model.
+    if (is.na(disp) || disp <= 1.5) {
+      lrt <- stats::anova(reduced_model, full_model, test = "Chisq")
+      lrt <- extract_lrt_table(lrt, tested_term = "Month")
+
+      return(list(
+        full_model = full_model,
+        reduced_model = reduced_model,
+        lrt_table = lrt,
+        model_type = "mixed_random_intercept",
+        family = "poisson",
+        poisson_overdispersion_ratio = disp,
+        warnings = unique(c(full_pois_mixed_fit$warnings, red_pois_mixed_fit$warnings))
+      ))
+    }
+
+    # If overdispersed, try negative binomial mixed model.
+    full_nb_mixed_fit <- fit_with_warnings(
+      lme4::glmer.nb(
+        OTU_Richness ~ Month + (1 | Nest_ID),
+        data = dat,
+        control = lme4::glmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 2e5)
+        )
+      )
+    )
+
+    red_nb_mixed_fit <- fit_with_warnings(
+      lme4::glmer.nb(
+        OTU_Richness ~ (1 | Nest_ID),
+        data = dat,
+        control = lme4::glmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 2e5)
+        )
+      )
+    )
+
+    nb_mixed_ok <- TRUE
+    nb_mixed_ok <- nb_mixed_ok && !inherits(full_nb_mixed_fit$fit, "error")
+    nb_mixed_ok <- nb_mixed_ok && !inherits(red_nb_mixed_fit$fit, "error")
+    nb_mixed_ok <- nb_mixed_ok && !mixed_model_problem(full_nb_mixed_fit$fit, full_nb_mixed_fit$warnings)
+    nb_mixed_ok <- nb_mixed_ok && !mixed_model_problem(red_nb_mixed_fit$fit, red_nb_mixed_fit$warnings)
+
+    if (isTRUE(nb_mixed_ok)) {
+      full_model <- full_nb_mixed_fit$fit
+      reduced_model <- red_nb_mixed_fit$fit
+
+      lrt <- stats::anova(reduced_model, full_model, test = "Chisq")
+      lrt <- extract_lrt_table(lrt, tested_term = "Month")
+
+      return(list(
+        full_model = full_model,
+        reduced_model = reduced_model,
+        lrt_table = lrt,
+        model_type = "mixed_random_intercept",
+        family = "negative_binomial",
+        poisson_overdispersion_ratio = disp,
+        warnings = unique(c(
+          full_pois_mixed_fit$warnings,
+          red_pois_mixed_fit$warnings,
+          full_nb_mixed_fit$warnings,
+          red_nb_mixed_fit$warnings
+        ))
+      ))
+    }
+  }
+
+  # ------------------------------
+  # Fixed-effect fallback route
+  # ------------------------------
+  full_pois_fixed <- stats::glm(
+    OTU_Richness ~ Month + Nest_ID,
+    family = stats::poisson,
+    data = dat
+  )
+
+  disp_fixed <- overdispersion_ratio(full_pois_fixed)
+
+  if (!is.na(disp_fixed) && disp_fixed > 1.5) {
+
+    full_nb_fixed <- MASS::glm.nb(
+      OTU_Richness ~ Month + Nest_ID,
+      data = dat
+    )
+
+    red_nb_fixed <- MASS::glm.nb(
+      OTU_Richness ~ Nest_ID,
+      data = dat
+    )
+
+    lrt <- stats::anova(red_nb_fixed, full_nb_fixed, test = "Chisq")
+    lrt <- extract_lrt_table(lrt, tested_term = "Month")
+
+    return(list(
+      full_model = full_nb_fixed,
+      reduced_model = red_nb_fixed,
+      lrt_table = lrt,
+      model_type = "fixed_effect_nest",
+      family = "negative_binomial",
+      poisson_overdispersion_ratio = disp_fixed,
+      warnings = character(0)
+    ))
+  }
+
+  red_pois_fixed <- stats::glm(
+    OTU_Richness ~ Nest_ID,
+    family = stats::poisson,
+    data = dat
+  )
+
+  lrt <- stats::anova(red_pois_fixed, full_pois_fixed, test = "Chisq")
+  lrt <- extract_lrt_table(lrt, tested_term = "Month")
+
+  return(list(
+    full_model = full_pois_fixed,
+    reduced_model = red_pois_fixed,
+    lrt_table = lrt,
+    model_type = "fixed_effect_nest",
+    family = "poisson",
+    poisson_overdispersion_ratio = disp_fixed,
+    warnings = character(0)
+  ))
+}
+
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
+otu   <- readr::read_csv(otu_fp, show_col_types = FALSE)
+guild <- readr::read_csv(guild_fp, show_col_types = FALSE)
+meta  <- readr::read_csv(meta_fp, show_col_types = FALSE)
+
+# --------------------------------------------------
+# Basic checks
+# --------------------------------------------------
+stopifnot("OTU_ID" %in% names(otu))
+stopifnot(all(c("OTU_ID", "primary_lifestyle", "Fruitbody_type_template") %in% names(guild)))
+stopifnot(all(c("Sample_ID", "Site", "Nest_ID", "Year", "Month") %in% names(meta)))
+
+# --------------------------------------------------
+# Restrict metadata to McKenzie year 2, focal nests, focal months
+# --------------------------------------------------
+meta_mck <- dplyr::filter(
+  meta,
+  Site == keep_site,
+  Year == keep_year,
+  Nest_ID %in% keep_nests,
+  Month %in% keep_months
+)
+
+meta_mck <- dplyr::select(meta_mck, Sample_ID, Nest_ID, Month)
+meta_mck <- dplyr::distinct(meta_mck)
+
+if (nrow(meta_mck) == 0) {
+  stop("No rows after filtering to Mckenzie year 2 + keep_nests + keep_months.")
+}
+
+meta_mck <- dplyr::mutate(
+  meta_mck,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Month = factor(Month, levels = keep_months, ordered = TRUE)
+)
+
+mck_samples <- unique(meta_mck$Sample_ID)
+
+# --------------------------------------------------
+# Define guild membership EXACTLY
+# --------------------------------------------------
+truffle_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template == "gasteroid-hypogeous"
+)
+
+truffle_ids <- unique(truffle_tbl$OTU_ID)
+
+epigeous_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template %in% c(
+    "agaricoid",
+    "gasteroid",
+    "clavarioid",
+    "apothecium_(hymenium_on_surface)"
+  )
+)
+
+epigeous_ids <- unique(epigeous_tbl$OTU_ID)
+
+# --------------------------------------------------
+# Build taxonomy table for OTU-level outputs
+# --------------------------------------------------
+truffle_tax <- dplyr::filter(guild, OTU_ID %in% truffle_ids)
+truffle_tax <- dplyr::select(
+  truffle_tax,
+  OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+truffle_tax <- dplyr::mutate(truffle_tax, Guild = "Truffle")
+
+epigeous_tax <- dplyr::filter(guild, OTU_ID %in% epigeous_ids)
+epigeous_tax <- dplyr::select(
+  epigeous_tax,
+  OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+epigeous_tax <- dplyr::mutate(epigeous_tax, Guild = "Epigeous_ECM")
+
+guild_tax <- dplyr::bind_rows(truffle_tax, epigeous_tax)
+guild_tax <- dplyr::distinct(guild_tax)
+
+# --------------------------------------------------
+# Match OTU sample columns to metadata sample IDs
+# --------------------------------------------------
+otu_samples <- setdiff(colnames(otu), "OTU_ID")
+mck_samples_present <- intersect(otu_samples, mck_samples)
+
+if (length(mck_samples_present) == 0) {
+  stop("No McKenzie year 2 Sample_IDs found in OTU table columns.")
+}
+
+# --------------------------------------------------
+# Build long OTU table for retained McKenzie samples only
+# --------------------------------------------------
+otu_sub <- dplyr::select(otu, OTU_ID, dplyr::all_of(mck_samples_present))
+
+otu_long <- tidyr::pivot_longer(
+  otu_sub,
+  cols = -OTU_ID,
+  names_to = "Sample_ID",
+  values_to = "RA"
+)
+
+otu_long$RA[is.na(otu_long$RA)] <- 0
+
+otu_long <- dplyr::left_join(otu_long, meta_mck, by = "Sample_ID")
+
+otu_long <- dplyr::mutate(
+  otu_long,
+  Guild = dplyr::case_when(
+    OTU_ID %in% truffle_ids ~ "Truffle",
+    OTU_ID %in% epigeous_ids ~ "Epigeous_ECM",
+    TRUE ~ NA_character_
+  )
+)
+
+otu_long <- dplyr::filter(otu_long, !is.na(Guild))
+
+otu_long <- dplyr::mutate(
+  otu_long,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Month = factor(Month, levels = keep_months, ordered = TRUE),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+# --------------------------------------------------
+# Sample-level summaries across thresholds
+# --------------------------------------------------
+sample_level_list <- list()
+
+for (i in seq_along(thresholds)) {
+
+  th <- thresholds[i]
+  tmp <- otu_long
+
+  if (th == 0) {
+    tmp <- dplyr::mutate(tmp, Detected = RA > 0)
+  } else {
+    tmp <- dplyr::mutate(tmp, Detected = RA >= th)
+  }
+
+  tmp <- dplyr::group_by(tmp, Sample_ID, Nest_ID, Month, Guild)
+
+  tmp <- dplyr::summarise(
+    tmp,
+    AnyDetected = as.integer(any(Detected)),
+    OTU_Richness = sum(Detected),
+    .groups = "drop"
+  )
+
+  tmp <- dplyr::mutate(tmp, Threshold = th)
+  sample_level_list[[i]] <- tmp
+}
+
+sample_level_all <- dplyr::bind_rows(sample_level_list)
+
+sample_level_all <- dplyr::mutate(
+  sample_level_all,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Month = factor(Month, levels = keep_months, ordered = TRUE),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+readr::write_csv(
+  sample_level_all,
+  file.path(out_dir, "mckenzie_h2_h4_sample_level_all_thresholds.csv")
+)
+
+# --------------------------------------------------
+# Month-level summary across thresholds
+# --------------------------------------------------
+month_summary_all <- dplyr::group_by(sample_level_all, Month, Guild, Threshold)
+
+month_summary_all <- dplyr::summarise(
+  month_summary_all,
+  N_Samples = dplyr::n(),
+  Detection_Frequency = mean(AnyDetected),
+  Mean_Sample_Richness = mean(OTU_Richness),
+  Median_Sample_Richness = stats::median(OTU_Richness),
+  Samples_With_Detection = sum(AnyDetected),
+  .groups = "drop"
+)
+
+month_summary_all <- dplyr::mutate(
+  month_summary_all,
+  Month = factor(Month, levels = keep_months, ordered = TRUE),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+readr::write_csv(
+  month_summary_all,
+  file.path(out_dir, "mckenzie_h2_h4_month_level_summary_all_thresholds.csv")
+)
+
+# --------------------------------------------------
+# Dedicated 1.0% plotting tables
+# --------------------------------------------------
+sample_level_plot <- dplyr::filter(sample_level_all, Threshold == plot_threshold)
+month_summary_plot <- dplyr::filter(month_summary_all, Threshold == plot_threshold)
+
+readr::write_csv(
+  sample_level_plot,
+  file.path(out_dir, "mckenzie_h2_sample_level_detection_1pct.csv")
+)
+
+readr::write_csv(
+  month_summary_plot,
+  file.path(out_dir, "mckenzie_h2_month_level_summary_1pct.csv")
+)
+
+# --------------------------------------------------
+# Run H2 models separately at each threshold
+# --------------------------------------------------
+robustness_rows <- list()
+diagnostics_rows <- list()
+
+for (i in seq_along(thresholds)) {
+
+  th <- thresholds[i]
+  th_lab <- threshold_label(th)
+
+  sample_th <- dplyr::filter(sample_level_all, Threshold == th)
+
+  # ================================================
+  # Truffle
+  # ================================================
+  truf_dat <- dplyr::filter(sample_th, Guild == "Truffle")
+
+  # Detection model
+  truf_det_fit <- fit_detection_model(truf_dat)
+  truf_det_lrt  <- truf_det_fit$lrt_table
+  truf_det_coef <- tidy_coefficients(truf_det_fit$full_model)
+
+  truf_det_lrt <- dplyr::mutate(
+    truf_det_lrt,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Detection",
+    Month_Model_Type = truf_det_fit$model_type,
+    Model_Family = truf_det_fit$family,
+    Model_Warnings = paste(truf_det_fit$warnings, collapse = " | ")
+  )
+
+  truf_det_coef <- dplyr::mutate(
+    truf_det_coef,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Detection",
+    Month_Model_Type = truf_det_fit$model_type,
+    Model_Family = truf_det_fit$family
+  )
+
+  readr::write_csv(
+    truf_det_lrt,
+    file.path(out_dir, paste0("mckenzie_h2_detection_anova_truffle_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    truf_det_coef,
+    file.path(out_dir, paste0("mckenzie_h2_detection_coefficients_truffle_", th_lab, ".csv"))
+  )
+
+  # Richness model
+  truf_rich_fit  <- fit_richness_model(truf_dat)
+  truf_rich_lrt  <- truf_rich_fit$lrt_table
+  truf_rich_coef <- tidy_coefficients(truf_rich_fit$full_model)
+
+  truf_rich_lrt <- dplyr::mutate(
+    truf_rich_lrt,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Richness",
+    Month_Model_Type = truf_rich_fit$model_type,
+    Model_Family = truf_rich_fit$family,
+    Poisson_Overdispersion_Ratio = truf_rich_fit$poisson_overdispersion_ratio,
+    Model_Warnings = paste(truf_rich_fit$warnings, collapse = " | ")
+  )
+
+  truf_rich_coef <- dplyr::mutate(
+    truf_rich_coef,
+    Threshold = th,
+    Guild = "Truffle",
+    Model = "Richness",
+    Month_Model_Type = truf_rich_fit$model_type,
+    Model_Family = truf_rich_fit$family,
+    Poisson_Overdispersion_Ratio = truf_rich_fit$poisson_overdispersion_ratio
+  )
+
+  readr::write_csv(
+    truf_rich_lrt,
+    file.path(out_dir, paste0("mckenzie_h2_richness_anova_truffle_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    truf_rich_coef,
+    file.path(out_dir, paste0("mckenzie_h2_richness_coefficients_truffle_", th_lab, ".csv"))
+  )
+
+  # Robustness row: truffle
+  robustness_rows[[length(robustness_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Truffle",
+    Detection_Month_Chisq = truf_det_lrt$Chisq,
+    Detection_Month_Df = truf_det_lrt$Df,
+    Detection_Month_p = truf_det_lrt$p_value,
+    Detection_Model_Type = truf_det_fit$model_type,
+    Detection_Model_Family = truf_det_fit$family,
+    Richness_Month_Chisq = truf_rich_lrt$Chisq,
+    Richness_Month_Df = truf_rich_lrt$Df,
+    Richness_Month_p = truf_rich_lrt$p_value,
+    Richness_Model_Type = truf_rich_fit$model_type,
+    Richness_Model_Family = truf_rich_fit$family,
+    Poisson_Overdispersion_Ratio = truf_rich_fit$poisson_overdispersion_ratio
+  )
+
+  diagnostics_rows[[length(diagnostics_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Truffle",
+    Detection_Model_Type = truf_det_fit$model_type,
+    Detection_Model_Family = truf_det_fit$family,
+    Richness_Model_Type = truf_rich_fit$model_type,
+    Richness_Model_Family = truf_rich_fit$family,
+    Poisson_Overdispersion_Ratio = truf_rich_fit$poisson_overdispersion_ratio,
+    Detection_Warnings = paste(truf_det_fit$warnings, collapse = " | "),
+    Richness_Warnings = paste(truf_rich_fit$warnings, collapse = " | ")
+  )
+
+  # ================================================
+  # Epigeous ECM
+  # ================================================
+  epi_dat <- dplyr::filter(sample_th, Guild == "Epigeous_ECM")
+
+  # Detection model
+  epi_det_fit <- fit_detection_model(epi_dat)
+  epi_det_lrt  <- epi_det_fit$lrt_table
+  epi_det_coef <- tidy_coefficients(epi_det_fit$full_model)
+
+  epi_det_lrt <- dplyr::mutate(
+    epi_det_lrt,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Detection",
+    Month_Model_Type = epi_det_fit$model_type,
+    Model_Family = epi_det_fit$family,
+    Model_Warnings = paste(epi_det_fit$warnings, collapse = " | ")
+  )
+
+  epi_det_coef <- dplyr::mutate(
+    epi_det_coef,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Detection",
+    Month_Model_Type = epi_det_fit$model_type,
+    Model_Family = epi_det_fit$family
+  )
+
+  readr::write_csv(
+    epi_det_lrt,
+    file.path(out_dir, paste0("mckenzie_h2_detection_anova_epigeous_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    epi_det_coef,
+    file.path(out_dir, paste0("mckenzie_h2_detection_coefficients_epigeous_", th_lab, ".csv"))
+  )
+
+  # Richness model
+  epi_rich_fit  <- fit_richness_model(epi_dat)
+  epi_rich_lrt  <- epi_rich_fit$lrt_table
+  epi_rich_coef <- tidy_coefficients(epi_rich_fit$full_model)
+
+  epi_rich_lrt <- dplyr::mutate(
+    epi_rich_lrt,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Richness",
+    Month_Model_Type = epi_rich_fit$model_type,
+    Model_Family = epi_rich_fit$family,
+    Poisson_Overdispersion_Ratio = epi_rich_fit$poisson_overdispersion_ratio,
+    Model_Warnings = paste(epi_rich_fit$warnings, collapse = " | ")
+  )
+
+  epi_rich_coef <- dplyr::mutate(
+    epi_rich_coef,
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Model = "Richness",
+    Month_Model_Type = epi_rich_fit$model_type,
+    Model_Family = epi_rich_fit$family,
+    Poisson_Overdispersion_Ratio = epi_rich_fit$poisson_overdispersion_ratio
+  )
+
+  readr::write_csv(
+    epi_rich_lrt,
+    file.path(out_dir, paste0("mckenzie_h2_richness_anova_epigeous_", th_lab, ".csv"))
+  )
+
+  readr::write_csv(
+    epi_rich_coef,
+    file.path(out_dir, paste0("mckenzie_h2_richness_coefficients_epigeous_", th_lab, ".csv"))
+  )
+
+  # Robustness row: epigeous
+  robustness_rows[[length(robustness_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Detection_Month_Chisq = epi_det_lrt$Chisq,
+    Detection_Month_Df = epi_det_lrt$Df,
+    Detection_Month_p = epi_det_lrt$p_value,
+    Detection_Model_Type = epi_det_fit$model_type,
+    Detection_Model_Family = epi_det_fit$family,
+    Richness_Month_Chisq = epi_rich_lrt$Chisq,
+    Richness_Month_Df = epi_rich_lrt$Df,
+    Richness_Month_p = epi_rich_lrt$p_value,
+    Richness_Model_Type = epi_rich_fit$model_type,
+    Richness_Model_Family = epi_rich_fit$family,
+    Poisson_Overdispersion_Ratio = epi_rich_fit$poisson_overdispersion_ratio
+  )
+
+  diagnostics_rows[[length(diagnostics_rows) + 1]] <- data.frame(
+    Threshold = th,
+    Guild = "Epigeous_ECM",
+    Detection_Model_Type = epi_det_fit$model_type,
+    Detection_Model_Family = epi_det_fit$family,
+    Richness_Model_Type = epi_rich_fit$model_type,
+    Richness_Model_Family = epi_rich_fit$family,
+    Poisson_Overdispersion_Ratio = epi_rich_fit$poisson_overdispersion_ratio,
+    Detection_Warnings = paste(epi_det_fit$warnings, collapse = " | "),
+    Richness_Warnings = paste(epi_rich_fit$warnings, collapse = " | ")
+  )
+}
+
+# --------------------------------------------------
+# Export combined robustness tables across thresholds
+# --------------------------------------------------
+robustness_tbl <- do.call(rbind, robustness_rows)
+diagnostics_tbl <- do.call(rbind, diagnostics_rows)
+
+robustness_tbl <- dplyr::arrange(robustness_tbl, Guild, Threshold)
+diagnostics_tbl <- dplyr::arrange(diagnostics_tbl, Guild, Threshold)
+
+readr::write_csv(
+  robustness_tbl,
+  file.path(out_dir, "mckenzie_h2_h4_robustness_summary_across_thresholds.csv")
+)
+
+readr::write_csv(
+  diagnostics_tbl,
+  file.path(out_dir, "mckenzie_h2_h4_model_diagnostics_across_thresholds.csv")
+)
+
+# --------------------------------------------------
+# OTU-level outputs for 1.0% threshold only
+# --------------------------------------------------
+otu_long_tax <- dplyr::left_join(otu_long, guild_tax, by = c("OTU_ID", "Guild"))
+
+otu_detected_plot <- otu_long_tax
+
+if (plot_threshold == 0) {
+  otu_detected_plot <- dplyr::mutate(otu_detected_plot, Detected = RA > 0)
+} else {
+  otu_detected_plot <- dplyr::mutate(otu_detected_plot, Detected = RA >= plot_threshold)
+}
+
+otu_detected_plot <- dplyr::filter(otu_detected_plot, Detected)
+
+# OTU-by-sample detections
+otu_sample_detections <- dplyr::select(
+  otu_detected_plot,
+  Sample_ID, Nest_ID, Month, Guild, OTU_ID, RA,
+  Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+otu_sample_detections <- dplyr::arrange(
+  otu_sample_detections,
+  Guild, Month, Nest_ID, OTU_ID, Sample_ID
+)
+
+readr::write_csv(
+  otu_sample_detections,
+  file.path(out_dir, "mckenzie_h2_otu_sample_detections_1pct.csv")
+)
+
+# Month-by-OTU summary
+month_sample_sizes <- dplyr::count(meta_mck, Month, name = "N_Samples_Total")
+month_sample_sizes <- dplyr::mutate(
+  month_sample_sizes,
+  Month = factor(Month, levels = keep_months, ordered = TRUE)
+)
+
+otu_month_summary <- dplyr::group_by(
+  otu_detected_plot,
+  Month, Guild, OTU_ID,
+  Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+otu_month_summary <- dplyr::summarise(
+  otu_month_summary,
+  Samples_Detected = dplyr::n_distinct(Sample_ID),
+  Mean_RA_When_Detected = mean(RA, na.rm = TRUE),
+  Median_RA_When_Detected = stats::median(RA, na.rm = TRUE),
+  Max_RA_When_Detected = max(RA, na.rm = TRUE),
+  .groups = "drop"
+)
+
+otu_month_summary <- dplyr::left_join(
+  otu_month_summary,
+  month_sample_sizes,
+  by = "Month"
+)
+
+otu_month_summary <- dplyr::mutate(
+  otu_month_summary,
+  Detection_Frequency_Within_Month = Samples_Detected / N_Samples_Total
+)
+
+otu_month_summary <- dplyr::arrange(
+  otu_month_summary,
+  Guild, Month, dplyr::desc(Samples_Detected), dplyr::desc(Max_RA_When_Detected)
+)
+
+readr::write_csv(
+  otu_month_summary,
+  file.path(out_dir, "mckenzie_h2_otu_month_summary_1pct.csv")
+)
+
+# Pooled unique OTU richness per month
+month_pooled_otu_richness <- dplyr::group_by(
+  otu_detected_plot,
+  Month, Guild
+)
+
+month_pooled_otu_richness <- dplyr::summarise(
+  month_pooled_otu_richness,
+  Pooled_Unique_OTUs = dplyr::n_distinct(OTU_ID),
+  Total_Detection_Events = dplyr::n(),
+  .groups = "drop"
+)
+
+month_pooled_otu_richness <- dplyr::mutate(
+  month_pooled_otu_richness,
+  Month = factor(Month, levels = keep_months, ordered = TRUE),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+month_pooled_otu_richness <- dplyr::arrange(
+  month_pooled_otu_richness,
+  Guild, Month
+)
+
+readr::write_csv(
+  month_pooled_otu_richness,
+  file.path(out_dir, "mckenzie_h2_month_pooled_otu_richness_1pct.csv")
+)
+
+# Wide month-by-OTU presence matrix
+otu_month_presence_matrix <- dplyr::distinct(otu_detected_plot, Month, Guild, OTU_ID)
+otu_month_presence_matrix <- dplyr::mutate(otu_month_presence_matrix, Present = 1L)
+
+otu_month_presence_matrix <- tidyr::pivot_wider(
+  otu_month_presence_matrix,
+  names_from = Month,
+  values_from = Present,
+  values_fill = 0
+)
+
+otu_month_presence_matrix <- dplyr::arrange(
+  otu_month_presence_matrix,
+  Guild, OTU_ID
+)
+
+readr::write_csv(
+  otu_month_presence_matrix,
+  file.path(out_dir, "mckenzie_h2_otu_month_presence_matrix_1pct.csv")
+)
+
+# --------------------------------------------------
+# Final messages
+# --------------------------------------------------
+message("Done.")
+message("Main outputs written to: ", out_dir)
+message("Key files:")
+message("  mckenzie_h2_h4_sample_level_all_thresholds.csv")
+message("  mckenzie_h2_h4_month_level_summary_all_thresholds.csv")
+message("  mckenzie_h2_h4_robustness_summary_across_thresholds.csv")
+message("  mckenzie_h2_h4_model_diagnostics_across_thresholds.csv")
+message("  mckenzie_h2_sample_level_detection_1pct.csv")
+message("  mckenzie_h2_month_level_summary_1pct.csv")
+message("  mckenzie_h2_otu_month_summary_1pct.csv")
+message("  mckenzie_h2_month_pooled_otu_richness_1pct.csv")
+```
+
+### MONTH NOT CODED AS ORDERED FACTOR: Explicitly test H3 (temporal heterogeneity) with H4 (consistency across thresholds) explicitly incorporated:
+
+```{r}
+################################################################################
+# PURPOSE:
+#   Export month-specific model-predicted values and 95% confidence intervals
+#   for the McKenzie temporal H2/H4 analyses across all thresholds.
+#
+# INPUTS:
+#   1) otu_table_collapsed_relative.csv
+#   2) guild_table_collapsed.csv
+#   3) metadata.csv
+#
+# OUTPUT:
+#   - mckenzie_h2_h4_month_predictions_across_thresholds.csv
+#
+# LOGIC:
+#   1) Rebuild the same sample-level temporal dataset used in the H3/H4 script.
+#   2) Refit the same detection and richness models for each guild and threshold.
+#   3) For each fitted model, generate month-specific predicted values on the
+#      response scale with 95% Wald confidence intervals.
+#   4) For mixed models, predictions are made at the population level
+#      (random intercept set to zero).
+#   5) For fixed-effect fallback models, predictions are averaged equally across
+#      nests so that month estimates are adjusted for Nest_ID without being
+#      driven by uneven sample counts.
+################################################################################
+
+# --------------------------------------------------------------------------
+# Libraries
+# --------------------------------------------------------------------------
+
+# Load data wrangling packages.
+library(dplyr)
+
+# Load reshaping tools.
+library(tidyr)
+
+# Load CSV import/export functions.
+library(readr)
+
+# Load support for mixed-model coefficient tidying if needed later.
+library(broom)
+library(broom.mixed)
+
+# Load tibble helpers.
+library(tibble)
+
+# Load negative binomial GLMs.
+library(MASS)
+
+# Load GLMM tools.
+library(lme4)
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+
+# Define input OTU table path.
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+
+# Define input guild table path.
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+
+# Define input metadata path.
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+# Define output directory.
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_h2_h4_temporal"
+
+# Create output directory if it does not already exist.
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------------------------------
+# Parameters
+# --------------------------------------------------------------------------
+
+# Define the relative-abundance thresholds to evaluate.
+thresholds <- c(0.0, 0.2, 0.5, 1.0, 1.5)
+
+# Define the focal site.
+keep_site   <- "Mckenzie"
+
+# Define the focal year.
+keep_year   <- 2
+
+# Define the focal nests.
+keep_nests  <- c("M1", "M3", "M6", "M8", "M9", "M10")
+
+# Define the focal months and their intended order.
+keep_months <- c("December", "January", "February", "March", "April")
+
+# --------------------------------------------------------------------------
+# Helper function: safely collect model warnings
+# --------------------------------------------------------------------------
+
+# Fit a model while capturing warnings so they can be saved and reported later.
+fit_with_warnings <- function(expr) {
+  warning_messages <- character(0)
+
+  fit <- withCallingHandlers(
+    tryCatch(
+      expr,
+      error = function(e) e
+    ),
+    warning = function(w) {
+      warning_messages <<- c(warning_messages, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  list(
+    fit = fit,
+    warnings = unique(warning_messages)
+  )
+}
+
+# --------------------------------------------------------------------------
+# Helper function: detect problematic mixed-model fit
+# --------------------------------------------------------------------------
+
+# Flag mixed models that are singular, failed, or otherwise unreliable.
+mixed_model_problem <- function(model, warnings_vec = character(0)) {
+
+  # Treat outright model errors as problematic.
+  if (inherits(model, "error")) {
+    return(TRUE)
+  }
+
+  # If the returned object is not a merMod object, it is not a valid mixed model.
+  if (!inherits(model, "merMod")) {
+    return(TRUE)
+  }
+
+  # Check singularity.
+  singular_flag <- FALSE
+  singular_flag <- tryCatch(
+    lme4::isSingular(model, tol = 1e-4),
+    error = function(e) FALSE
+  )
+
+  # Extract convergence messages if present.
+  conv_messages <- character(0)
+  conv_messages <- tryCatch(
+    unlist(model@optinfo$conv$lme4$messages),
+    error = function(e) character(0)
+  )
+
+  # Define warning patterns that indicate poor model fit.
+  bad_warning_patterns <- c(
+    "failed to converge",
+    "degenerate",
+    "singular",
+    "non-positive-definite",
+    "unable to evaluate scaled gradient",
+    "Model failed to converge",
+    "boundary \\(singular\\) fit"
+  )
+
+  # Check whether any warnings match the bad-fit patterns.
+  has_bad_warning <- FALSE
+  if (length(warnings_vec) > 0 || length(conv_messages) > 0) {
+    all_msgs <- c(warnings_vec, conv_messages)
+    has_bad_warning <- any(
+      grepl(
+        paste(bad_warning_patterns, collapse = "|"),
+        all_msgs,
+        ignore.case = TRUE
+      )
+    )
+  }
+
+  # Return TRUE if the model has any major fit problem.
+  return(isTRUE(singular_flag) || has_bad_warning)
+}
+
+# --------------------------------------------------------------------------
+# Helper function: compute overdispersion ratio
+# --------------------------------------------------------------------------
+
+# Compute a Pearson residual overdispersion ratio for GLMs or mixed models.
+overdispersion_ratio <- function(model) {
+
+  # Handle standard GLMs.
+  if (inherits(model, "glm")) {
+    rp <- residuals(model, type = "pearson")
+    rdf <- df.residual(model)
+
+    if (rdf <= 0) return(NA_real_)
+    return(sum(rp^2, na.rm = TRUE) / rdf)
+  }
+
+  # Handle mixed models approximately.
+  if (inherits(model, "merMod")) {
+    rp <- residuals(model, type = "pearson")
+    n_obs <- nobs(model)
+
+    # Approximate residual df pragmatically.
+    n_fixef <- tryCatch(length(lme4::fixef(model)), error = function(e) NA_integer_)
+    rdf <- n_obs - n_fixef - 1
+
+    if (is.na(rdf) || rdf <= 0) return(NA_real_)
+    return(sum(rp^2, na.rm = TRUE) / rdf)
+  }
+
+  # Return NA if model class is unsupported.
+  return(NA_real_)
+}
+
+# --------------------------------------------------------------------------
+# Helper function: fit detection model with mixed first, fixed fallback
+# --------------------------------------------------------------------------
+
+# Fit the month effect on AnyDetected using the same logic as the original script.
+fit_detection_model <- function(dat) {
+
+  # Attempt the full mixed model first.
+  full_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      AnyDetected ~ Month + (1 | Nest_ID),
+      family = stats::binomial,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  # Attempt the reduced mixed model without Month.
+  red_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      AnyDetected ~ (1 | Nest_ID),
+      family = stats::binomial,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  # Evaluate whether mixed-model fitting was acceptable.
+  mixed_ok <- TRUE
+  mixed_ok <- mixed_ok && !inherits(full_mixed_fit$fit, "error")
+  mixed_ok <- mixed_ok && !inherits(red_mixed_fit$fit, "error")
+  mixed_ok <- mixed_ok && !mixed_model_problem(full_mixed_fit$fit, full_mixed_fit$warnings)
+  mixed_ok <- mixed_ok && !mixed_model_problem(red_mixed_fit$fit, red_mixed_fit$warnings)
+
+  # If acceptable, return the mixed model.
+  if (isTRUE(mixed_ok)) {
+    return(list(
+      full_model = full_mixed_fit$fit,
+      reduced_model = red_mixed_fit$fit,
+      model_type = "mixed_random_intercept",
+      family = "binomial",
+      warnings = unique(c(full_mixed_fit$warnings, red_mixed_fit$warnings))
+    ))
+  }
+
+  # Otherwise, fall back to fixed-effect Nest_ID.
+  full_fixed <- stats::glm(
+    AnyDetected ~ Month + Nest_ID,
+    family = stats::binomial,
+    data = dat
+  )
+
+  reduced_fixed <- stats::glm(
+    AnyDetected ~ Nest_ID,
+    family = stats::binomial,
+    data = dat
+  )
+
+  return(list(
+    full_model = full_fixed,
+    reduced_model = reduced_fixed,
+    model_type = "fixed_effect_nest",
+    family = "binomial",
+    warnings = unique(c(full_mixed_fit$warnings, red_mixed_fit$warnings))
+  ))
+}
+
+# --------------------------------------------------------------------------
+# Helper function: fit richness model with mixed first, fixed fallback
+# --------------------------------------------------------------------------
+
+# Fit the month effect on OTU_Richness using the same logic as the original script.
+fit_richness_model <- function(dat) {
+
+  # Try Poisson mixed model first.
+  full_pois_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      OTU_Richness ~ Month + (1 | Nest_ID),
+      family = stats::poisson,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  # Fit reduced Poisson mixed model.
+  red_pois_mixed_fit <- fit_with_warnings(
+    lme4::glmer(
+      OTU_Richness ~ (1 | Nest_ID),
+      family = stats::poisson,
+      data = dat,
+      control = lme4::glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    )
+  )
+
+  # Evaluate whether Poisson mixed models are acceptable.
+  pois_mixed_ok <- TRUE
+  pois_mixed_ok <- pois_mixed_ok && !inherits(full_pois_mixed_fit$fit, "error")
+  pois_mixed_ok <- pois_mixed_ok && !inherits(red_pois_mixed_fit$fit, "error")
+  pois_mixed_ok <- pois_mixed_ok && !mixed_model_problem(full_pois_mixed_fit$fit, full_pois_mixed_fit$warnings)
+  pois_mixed_ok <- pois_mixed_ok && !mixed_model_problem(red_pois_mixed_fit$fit, red_pois_mixed_fit$warnings)
+
+  # If the Poisson mixed model is acceptable, examine overdispersion.
+  if (isTRUE(pois_mixed_ok)) {
+
+    full_model <- full_pois_mixed_fit$fit
+    reduced_model <- red_pois_mixed_fit$fit
+    disp <- overdispersion_ratio(full_model)
+
+    # If overdispersion is modest, keep the Poisson mixed model.
+    if (is.na(disp) || disp <= 1.5) {
+      return(list(
+        full_model = full_model,
+        reduced_model = reduced_model,
+        model_type = "mixed_random_intercept",
+        family = "poisson",
+        poisson_overdispersion_ratio = disp,
+        warnings = unique(c(full_pois_mixed_fit$warnings, red_pois_mixed_fit$warnings))
+      ))
+    }
+
+    # If overdispersed, try negative binomial mixed models.
+    full_nb_mixed_fit <- fit_with_warnings(
+      lme4::glmer.nb(
+        OTU_Richness ~ Month + (1 | Nest_ID),
+        data = dat,
+        control = lme4::glmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 2e5)
+        )
+      )
+    )
+
+    red_nb_mixed_fit <- fit_with_warnings(
+      lme4::glmer.nb(
+        OTU_Richness ~ (1 | Nest_ID),
+        data = dat,
+        control = lme4::glmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 2e5)
+        )
+      )
+    )
+
+    # Evaluate whether negative binomial mixed models are acceptable.
+    nb_mixed_ok <- TRUE
+    nb_mixed_ok <- nb_mixed_ok && !inherits(full_nb_mixed_fit$fit, "error")
+    nb_mixed_ok <- nb_mixed_ok && !inherits(red_nb_mixed_fit$fit, "error")
+    nb_mixed_ok <- nb_mixed_ok && !mixed_model_problem(full_nb_mixed_fit$fit, full_nb_mixed_fit$warnings)
+    nb_mixed_ok <- nb_mixed_ok && !mixed_model_problem(red_nb_mixed_fit$fit, red_nb_mixed_fit$warnings)
+
+    # If acceptable, keep the negative binomial mixed model.
+    if (isTRUE(nb_mixed_ok)) {
+      return(list(
+        full_model = full_nb_mixed_fit$fit,
+        reduced_model = red_nb_mixed_fit$fit,
+        model_type = "mixed_random_intercept",
+        family = "negative_binomial",
+        poisson_overdispersion_ratio = disp,
+        warnings = unique(c(
+          full_pois_mixed_fit$warnings,
+          red_pois_mixed_fit$warnings,
+          full_nb_mixed_fit$warnings,
+          red_nb_mixed_fit$warnings
+        ))
+      ))
+    }
+  }
+
+  # If mixed models fail, fit fixed-effect Nest_ID models.
+  full_pois_fixed <- stats::glm(
+    OTU_Richness ~ Month + Nest_ID,
+    family = stats::poisson,
+    data = dat
+  )
+
+  disp_fixed <- overdispersion_ratio(full_pois_fixed)
+
+  # If fixed-effect Poisson is overdispersed, use fixed-effect NB.
+  if (!is.na(disp_fixed) && disp_fixed > 1.5) {
+
+    full_nb_fixed <- MASS::glm.nb(
+      OTU_Richness ~ Month + Nest_ID,
+      data = dat
+    )
+
+    red_nb_fixed <- MASS::glm.nb(
+      OTU_Richness ~ Nest_ID,
+      data = dat
+    )
+
+    return(list(
+      full_model = full_nb_fixed,
+      reduced_model = red_nb_fixed,
+      model_type = "fixed_effect_nest",
+      family = "negative_binomial",
+      poisson_overdispersion_ratio = disp_fixed,
+      warnings = character(0)
+    ))
+  }
+
+  # Otherwise keep the fixed-effect Poisson model.
+  red_pois_fixed <- stats::glm(
+    OTU_Richness ~ Nest_ID,
+    family = stats::poisson,
+    data = dat
+  )
+
+  return(list(
+    full_model = full_pois_fixed,
+    reduced_model = red_pois_fixed,
+    model_type = "fixed_effect_nest",
+    family = "poisson",
+    poisson_overdispersion_ratio = disp_fixed,
+    warnings = character(0)
+  ))
+}
+
+# --------------------------------------------------------------------------
+# Helper function: inverse-link behavior by response family
+# --------------------------------------------------------------------------
+
+# Return the inverse-link function appropriate for each model family.
+inverse_link <- function(eta, family_name) {
+  if (family_name == "binomial") {
+    return(stats::plogis(eta))
+  }
+  if (family_name %in% c("poisson", "negative_binomial")) {
+    return(exp(eta))
+  }
+  stop(paste("Unsupported family:", family_name))
+}
+
+# --------------------------------------------------------------------------
+# Helper function: build balanced prediction grid
+# --------------------------------------------------------------------------
+
+# Build a newdata grid for month predictions.
+build_prediction_grid <- function(model_type, months, nests) {
+
+  # For mixed models, predictions depend only on the fixed Month effect and
+  # are made at the population level with random intercept = 0.
+  if (model_type == "mixed_random_intercept") {
+    newdata <- data.frame(
+      Month = factor(months, levels = months, ordered = TRUE)
+    )
+    return(newdata)
+  }
+
+  # For fixed-effect Nest_ID models, create all month × nest combinations so
+  # predictions can later be averaged equally across nests.
+  if (model_type == "fixed_effect_nest") {
+    newdata <- expand.grid(
+      Month = months,
+      Nest_ID = nests,
+      stringsAsFactors = FALSE
+    )
+
+    newdata$Month <- factor(newdata$Month, levels = months, ordered = TRUE)
+    newdata$Nest_ID <- factor(newdata$Nest_ID, levels = nests)
+
+    return(newdata)
+  }
+
+  stop(paste("Unsupported model_type:", model_type))
+}
+
+# --------------------------------------------------------------------------
+# Helper function: extract month-specific predictions and CIs
+# --------------------------------------------------------------------------
+
+# Generate month-specific predictions and Wald CIs on the response scale.
+extract_month_predictions <- function(model, model_type, family_name,
+                                      threshold_value, guild_label, response_label,
+                                      months, nests) {
+
+  # Build the balanced prediction grid.
+  newdata <- build_prediction_grid(
+    model_type = model_type,
+    months = months,
+    nests = nests
+  )
+
+  # For mixed models, obtain fixed-effects design matrix from the fixed-only formula.
+  if (inherits(model, "merMod")) {
+
+    # Build a one-sided fixed-effects formula from the model's fixed effects.
+    fixed_formula <- lme4::nobars(formula(model))
+
+    # Delete the response so model.matrix can be built on newdata.
+    fixed_terms <- stats::delete.response(stats::terms(fixed_formula))
+
+    # Construct the fixed-effects design matrix.
+    X <- stats::model.matrix(fixed_terms, newdata)
+
+    # Extract fixed-effect coefficients.
+    beta <- lme4::fixef(model)
+
+    # Extract fixed-effect variance-covariance matrix.
+    V <- as.matrix(vcov(model))
+
+    # Compute predictions on the link scale.
+    eta <- as.vector(X %*% beta)
+
+    # Compute link-scale standard errors.
+    se_eta <- sqrt(diag(X %*% V %*% t(X)))
+  } else {
+
+    # For standard GLMs, use the same model-matrix logic.
+    terms_obj <- stats::delete.response(stats::terms(model))
+    X <- stats::model.matrix(terms_obj, newdata)
+    beta <- stats::coef(model)
+    V <- as.matrix(vcov(model))
+
+    eta <- as.vector(X %*% beta)
+    se_eta <- sqrt(diag(X %*% V %*% t(X)))
+  }
+
+  # Compute link-scale confidence limits.
+  eta_lower <- eta - 1.96 * se_eta
+  eta_upper <- eta + 1.96 * se_eta
+
+  # Convert predictions to the response scale.
+  pred <- inverse_link(eta, family_name)
+  pred_lower <- inverse_link(eta_lower, family_name)
+  pred_upper <- inverse_link(eta_upper, family_name)
+
+  # Bind predictions back onto the prediction grid.
+  pred_df <- newdata
+  pred_df$eta <- eta
+  pred_df$se_eta <- se_eta
+  pred_df$Predicted <- pred
+  pred_df$CI_Lower <- pred_lower
+  pred_df$CI_Upper <- pred_upper
+
+  # If the model is mixed, each row is already one month-level prediction.
+  if (model_type == "mixed_random_intercept") {
+    out <- pred_df %>%
+      dplyr::transmute(
+        Threshold = threshold_value,
+        Guild = guild_label,
+        Response = response_label,
+        Month = Month,
+        Model_Type = model_type,
+        Model_Family = family_name,
+        Predicted = Predicted,
+        CI_Lower = CI_Lower,
+        CI_Upper = CI_Upper
+      )
+    return(out)
+  }
+
+  # If the model is fixed-effect Nest_ID, average equally across nests within month.
+  # This yields month predictions adjusted for nest while avoiding unequal sample-size weighting.
+  if (model_type == "fixed_effect_nest") {
+    out <- pred_df %>%
+      dplyr::group_by(Month) %>%
+      dplyr::summarise(
+        Predicted = mean(Predicted, na.rm = TRUE),
+        CI_Lower = mean(CI_Lower, na.rm = TRUE),
+        CI_Upper = mean(CI_Upper, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        Threshold = threshold_value,
+        Guild = guild_label,
+        Response = response_label,
+        Model_Type = model_type,
+        Model_Family = family_name
+      ) %>%
+      dplyr::select(
+        Threshold, Guild, Response, Month,
+        Model_Type, Model_Family,
+        Predicted, CI_Lower, CI_Upper
+      )
+    return(out)
+  }
+
+  stop("Unhandled model type in prediction extraction.")
+}
+
+# --------------------------------------------------------------------------
+# Load data
+# --------------------------------------------------------------------------
+
+# Read the OTU table.
+otu <- readr::read_csv(otu_fp, show_col_types = FALSE)
+
+# Read the guild annotation table.
+guild <- readr::read_csv(guild_fp, show_col_types = FALSE)
+
+# Read the metadata.
+meta <- readr::read_csv(meta_fp, show_col_types = FALSE)
+
+# --------------------------------------------------------------------------
+# Basic checks
+# --------------------------------------------------------------------------
+
+# Confirm OTU_ID exists in the OTU table.
+stopifnot("OTU_ID" %in% names(otu))
+
+# Confirm required guild columns exist.
+stopifnot(all(c("OTU_ID", "primary_lifestyle", "Fruitbody_type_template") %in% names(guild)))
+
+# Confirm required metadata columns exist.
+stopifnot(all(c("Sample_ID", "Site", "Nest_ID", "Year", "Month") %in% names(meta)))
+
+# --------------------------------------------------------------------------
+# Restrict metadata to McKenzie year 2, focal nests, focal months
+# --------------------------------------------------------------------------
+
+# Filter metadata to the focal temporal subset.
+meta_mck <- dplyr::filter(
+  meta,
+  Site == keep_site,
+  Year == keep_year,
+  Nest_ID %in% keep_nests,
+  Month %in% keep_months
+)
+
+# Keep only the columns needed for temporal modeling.
+meta_mck <- dplyr::select(meta_mck, Sample_ID, Nest_ID, Month)
+
+# Remove accidental duplicates.
+meta_mck <- dplyr::distinct(meta_mck)
+
+# Stop if the temporal subset is empty.
+if (nrow(meta_mck) == 0) {
+  stop("No rows after filtering to Mckenzie year 2 + keep_nests + keep_months.")
+}
+
+# Enforce the intended factor ordering.
+meta_mck <- dplyr::mutate(
+  meta_mck,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Month = factor(Month, levels = keep_months, ordered = TRUE)
+)
+
+# Extract the set of retained sample IDs.
+mck_samples <- unique(meta_mck$Sample_ID)
+
+# --------------------------------------------------------------------------
+# Define guild membership exactly 
+# --------------------------------------------------------------------------
+
+# Identify truffle OTUs.
+truffle_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template == "gasteroid-hypogeous"
+)
+
+# Store truffle OTU IDs.
+truffle_ids <- unique(truffle_tbl$OTU_ID)
+
+# Identify epigeous ECM OTUs.
+epigeous_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template %in% c(
+    "agaricoid",
+    "gasteroid",
+    "clavarioid",
+    "apothecium_(hymenium_on_surface)"
+  )
+)
+
+# Store epigeous ECM OTU IDs.
+epigeous_ids <- unique(epigeous_tbl$OTU_ID)
+
+# --------------------------------------------------------------------------
+# Match OTU sample columns to metadata sample IDs
+# --------------------------------------------------------------------------
+
+# Get sample columns from the OTU table.
+otu_samples <- setdiff(colnames(otu), "OTU_ID")
+
+# Keep only the focal temporal samples present in both metadata and OTU table.
+mck_samples_present <- intersect(otu_samples, mck_samples)
+
+# Stop if there are no matching samples.
+if (length(mck_samples_present) == 0) {
+  stop("No McKenzie year 2 Sample_IDs found in OTU table columns.")
+}
+
+# --------------------------------------------------------------------------
+# Build long OTU table for retained McKenzie samples only
+# --------------------------------------------------------------------------
+
+# Restrict the OTU table to focal samples.
+otu_sub <- dplyr::select(otu, OTU_ID, dplyr::all_of(mck_samples_present))
+
+# Pivot to long format.
+otu_long <- tidyr::pivot_longer(
+  otu_sub,
+  cols = -OTU_ID,
+  names_to = "Sample_ID",
+  values_to = "RA"
+)
+
+# Replace missing relative abundances with zero.
+otu_long$RA[is.na(otu_long$RA)] <- 0
+
+# Join temporal metadata onto the long OTU table.
+otu_long <- dplyr::left_join(otu_long, meta_mck, by = "Sample_ID")
+
+# Assign each OTU to a focal guild if applicable.
+otu_long <- dplyr::mutate(
+  otu_long,
+  Guild = dplyr::case_when(
+    OTU_ID %in% truffle_ids ~ "Truffle",
+    OTU_ID %in% epigeous_ids ~ "Epigeous_ECM",
+    TRUE ~ NA_character_
+  )
+)
+
+# Drop OTUs outside the focal guilds.
+otu_long <- dplyr::filter(otu_long, !is.na(Guild))
+
+# Reapply the desired factor ordering.
+otu_long <- dplyr::mutate(
+  otu_long,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Month = factor(Month, levels = keep_months, ordered = TRUE),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+# --------------------------------------------------------------------------
+# Build sample-level summaries across thresholds
+# --------------------------------------------------------------------------
+
+# Initialize a list to store sample-level tables for each threshold.
+sample_level_list <- list()
+
+# Loop across thresholds.
+for (i in seq_along(thresholds)) {
+
+  # Get the current threshold.
+  th <- thresholds[i]
+
+  # Start from the long OTU table.
+  tmp <- otu_long
+
+  # Apply threshold detection logic.
+  if (th == 0) {
+    tmp <- dplyr::mutate(tmp, Detected = RA > 0)
+  } else {
+    tmp <- dplyr::mutate(tmp, Detected = RA >= th)
+  }
+
+  # Collapse to one row per sample × nest × month × guild.
+  tmp <- dplyr::group_by(tmp, Sample_ID, Nest_ID, Month, Guild)
+
+  # Compute sample-level AnyDetected and OTU_Richness.
+  tmp <- dplyr::summarise(
+    tmp,
+    AnyDetected = as.integer(any(Detected)),
+    OTU_Richness = sum(Detected),
+    .groups = "drop"
+  )
+
+  # Tag with the threshold value.
+  tmp <- dplyr::mutate(tmp, Threshold = th)
+
+  # Save into the list.
+  sample_level_list[[i]] <- tmp
+}
+
+# Combine all threshold-specific sample-level tables.
+sample_level_all <- dplyr::bind_rows(sample_level_list)
+
+# Reapply factor levels.
+sample_level_all <- dplyr::mutate(
+  sample_level_all,
+  Nest_ID = factor(Nest_ID, levels = keep_nests),
+  Month = factor(Month, levels = keep_months, ordered = TRUE),
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM"))
+)
+
+# --------------------------------------------------------------------------
+# Fit models and export month-specific predictions
+# --------------------------------------------------------------------------
+
+# Initialize a list to collect prediction rows.
+prediction_rows <- list()
+
+# Loop across thresholds.
+for (i in seq_along(thresholds)) {
+
+  # Get current threshold value.
+  th <- thresholds[i]
+
+  # Restrict the sample-level data to the current threshold.
+  sample_th <- dplyr::filter(sample_level_all, Threshold == th)
+
+  # ----------------------------------------------------------------------
+  # Truffle detection
+  # ----------------------------------------------------------------------
+
+  # Restrict to truffle rows.
+  truf_dat <- dplyr::filter(sample_th, Guild == "Truffle")
+
+  # Fit truffle detection model.
+  truf_det_fit <- fit_detection_model(truf_dat)
+
+  # Extract month-level detection predictions.
+  truf_det_pred <- extract_month_predictions(
+    model = truf_det_fit$full_model,
+    model_type = truf_det_fit$model_type,
+    family_name = truf_det_fit$family,
+    threshold_value = th,
+    guild_label = "Truffle",
+    response_label = "Detection",
+    months = keep_months,
+    nests = keep_nests
+  )
+
+  # Add warnings as a column for transparency.
+  truf_det_pred <- dplyr::mutate(
+    truf_det_pred,
+    Model_Warnings = paste(truf_det_fit$warnings, collapse = " | ")
+  )
+
+  # Save output.
+  prediction_rows[[length(prediction_rows) + 1]] <- truf_det_pred
+
+  # ----------------------------------------------------------------------
+  # Truffle richness
+  # ----------------------------------------------------------------------
+
+  # Fit truffle richness model.
+  truf_rich_fit <- fit_richness_model(truf_dat)
+
+  # Extract month-level richness predictions.
+  truf_rich_pred <- extract_month_predictions(
+    model = truf_rich_fit$full_model,
+    model_type = truf_rich_fit$model_type,
+    family_name = truf_rich_fit$family,
+    threshold_value = th,
+    guild_label = "Truffle",
+    response_label = "Richness",
+    months = keep_months,
+    nests = keep_nests
+  )
+
+  # Add dispersion and warnings.
+  truf_rich_pred <- dplyr::mutate(
+    truf_rich_pred,
+    Poisson_Overdispersion_Ratio = truf_rich_fit$poisson_overdispersion_ratio,
+    Model_Warnings = paste(truf_rich_fit$warnings, collapse = " | ")
+  )
+
+  # Save output.
+  prediction_rows[[length(prediction_rows) + 1]] <- truf_rich_pred
+
+  # ----------------------------------------------------------------------
+  # Epigeous ECM detection
+  # ----------------------------------------------------------------------
+
+  # Restrict to epigeous ECM rows.
+  epi_dat <- dplyr::filter(sample_th, Guild == "Epigeous_ECM")
+
+  # Fit epigeous detection model.
+  epi_det_fit <- fit_detection_model(epi_dat)
+
+  # Extract month-level detection predictions.
+  epi_det_pred <- extract_month_predictions(
+    model = epi_det_fit$full_model,
+    model_type = epi_det_fit$model_type,
+    family_name = epi_det_fit$family,
+    threshold_value = th,
+    guild_label = "Epigeous_ECM",
+    response_label = "Detection",
+    months = keep_months,
+    nests = keep_nests
+  )
+
+  # Add warnings.
+  epi_det_pred <- dplyr::mutate(
+    epi_det_pred,
+    Model_Warnings = paste(epi_det_fit$warnings, collapse = " | ")
+  )
+
+  # Save output.
+  prediction_rows[[length(prediction_rows) + 1]] <- epi_det_pred
+
+  # ----------------------------------------------------------------------
+  # Epigeous ECM richness
+  # ----------------------------------------------------------------------
+
+  # Fit epigeous richness model.
+  epi_rich_fit <- fit_richness_model(epi_dat)
+
+  # Extract month-level richness predictions.
+  epi_rich_pred <- extract_month_predictions(
+    model = epi_rich_fit$full_model,
+    model_type = epi_rich_fit$model_type,
+    family_name = epi_rich_fit$family,
+    threshold_value = th,
+    guild_label = "Epigeous_ECM",
+    response_label = "Richness",
+    months = keep_months,
+    nests = keep_nests
+  )
+
+  # Add dispersion and warnings.
+  epi_rich_pred <- dplyr::mutate(
+    epi_rich_pred,
+    Poisson_Overdispersion_Ratio = epi_rich_fit$poisson_overdispersion_ratio,
+    Model_Warnings = paste(epi_rich_fit$warnings, collapse = " | ")
+  )
+
+  # Save output.
+  prediction_rows[[length(prediction_rows) + 1]] <- epi_rich_pred
+}
+
+# Combine all prediction rows into one table.
+predictions_tbl <- dplyr::bind_rows(prediction_rows)
+
+# Ensure clean factor ordering in the final export.
+predictions_tbl <- dplyr::mutate(
+  predictions_tbl,
+  Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM")),
+  Response = factor(Response, levels = c("Detection", "Richness")),
+  Month = factor(Month, levels = keep_months, ordered = TRUE)
+)
+
+# Sort the final output table.
+predictions_tbl <- dplyr::arrange(
+  predictions_tbl,
+  Guild, Response, Threshold, Month
+)
+
+# Write the final month-prediction table to disk.
+readr::write_csv(
+  predictions_tbl,
+  file.path(out_dir, "mckenzie_h2_h4_month_predictions_across_thresholds.csv")
+)
+
+# --------------------------------------------------------------------------
+# Final messages
+# --------------------------------------------------------------------------
+
+# Print completion message.
+message("Done.")
+
+# Print output location.
+message("Wrote: ", file.path(out_dir, "mckenzie_h2_h4_month_predictions_across_thresholds.csv"))
+```
+
+
+
+####### PLOT FIGURE 6 ##########
+
+"""
+Purpose:
+    Create two separate SVG panels for the McKenzie H3/H4 temporal figure.
+
+Inputs:
+    1) mckenzie_h2_month_level_summary_1pct.csv
+       - used for Panel A: monthly detection frequency by guild
+    2) mckenzie_h2_month_pooled_otu_richness_1pct.csv
+       - used for Panel B: pooled monthly OTU richness by guild
+
+Logic:
+    - Read the two input CSV files
+    - Standardize month order and guild order
+    - Build paired bar plots for:
+        Panel A = detection frequency by month
+        Panel B = pooled monthly OTU richness
+    - Save each panel separately as an SVG
+
+Outputs:
+    1) panel_A_month_detection_frequency_1pct.svg
+    2) panel_B_month_pooled_richness_1pct.svg
+"""
+
+# -----------------------------
+# Imports
+# -----------------------------
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# File paths
+# -----------------------------
+base_dir = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/mckenzie_h2_h4_temporal")
+plot_dir = base_dir / "plots"
+plot_dir.mkdir(parents=True, exist_ok=True)
+
+detection_fp = base_dir / "mckenzie_h2_month_level_summary_1pct.csv"
+richness_fp = base_dir / "mckenzie_h2_month_pooled_otu_richness_1pct.csv"
+
+# -----------------------------
+# User-defined plotting settings
+# -----------------------------
+month_order = ["December", "January", "February", "March", "April"]
+guild_order = ["Truffle", "Epigeous_ECM"]
+
+guild_colors = {
+    "Truffle": "#1B9E77",
+    "Epigeous_ECM": "#D95F02"
+}
+
+month_label_map = {
+    "December": "Dec",
+    "January": "Jan",
+    "February": "Feb",
+    "March": "Mar",
+    "April": "Apr"
+}
+
+bar_width = 0.38
+
+# -----------------------------
+# Load input data
+# -----------------------------
+detection_df = pd.read_csv(detection_fp)
+richness_df = pd.read_csv(richness_fp)
+
+# -----------------------------
+# Basic input checks
+# -----------------------------
+required_detection_cols = {"Month", "Guild", "Detection_Frequency"}
+missing_detection = required_detection_cols - set(detection_df.columns)
+if missing_detection:
+    raise ValueError(
+        f"Detection summary file is missing required columns: {sorted(missing_detection)}"
+    )
+
+required_richness_cols = {"Month", "Guild", "Pooled_Unique_OTUs"}
+missing_richness = required_richness_cols - set(richness_df.columns)
+if missing_richness:
+    raise ValueError(
+        f"Richness summary file is missing required columns: {sorted(missing_richness)}"
+    )
+
+# -----------------------------
+# Standardize categorical order
+# -----------------------------
+detection_df["Month"] = pd.Categorical(
+    detection_df["Month"],
+    categories=month_order,
+    ordered=True
+)
+
+detection_df["Guild"] = pd.Categorical(
+    detection_df["Guild"],
+    categories=guild_order,
+    ordered=True
+)
+
+richness_df["Month"] = pd.Categorical(
+    richness_df["Month"],
+    categories=month_order,
+    ordered=True
+)
+
+richness_df["Guild"] = pd.Categorical(
+    richness_df["Guild"],
+    categories=guild_order,
+    ordered=True
+)
+
+detection_df = detection_df.sort_values(["Month", "Guild"]).reset_index(drop=True)
+richness_df = richness_df.sort_values(["Month", "Guild"]).reset_index(drop=True)
+
+# -----------------------------
+# Reshape for plotting
+# -----------------------------
+detection_wide = detection_df.pivot(
+    index="Month",
+    columns="Guild",
+    values="Detection_Frequency"
+)
+
+detection_wide = detection_wide.reindex(index=month_order, columns=guild_order)
+
+richness_wide = richness_df.pivot(
+    index="Month",
+    columns="Guild",
+    values="Pooled_Unique_OTUs"
+)
+
+richness_wide = richness_wide.reindex(index=month_order, columns=guild_order)
+
+# Fill missing cells with zero so sparse months still plot cleanly.
+detection_wide = detection_wide.fillna(0)
+richness_wide = richness_wide.fillna(0)
+
+# -----------------------------
+# Helper function for styling
+# -----------------------------
+def style_axes(ax):
+    """Apply consistent clean styling."""
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="x", labelsize=11)
+    ax.tick_params(axis="y", labelsize=11)
+
+# -----------------------------
+# Shared x positions
+# -----------------------------
+x_positions = list(range(len(month_order)))
+x_truffle = [x - bar_width / 2 for x in x_positions]
+x_epigeous = [x + bar_width / 2 for x in x_positions]
+month_labels = [month_label_map[m] for m in month_order]
+
+# -----------------------------
+# Panel A: Detection frequency
+# -----------------------------
+fig, ax = plt.subplots(figsize=(7, 5))
+
+ax.bar(
+    x_truffle,
+    detection_wide["Truffle"].values,
+    width=bar_width,
+    label="Truffle",
+    color=guild_colors["Truffle"]
+)
+
+ax.bar(
+    x_epigeous,
+    detection_wide["Epigeous_ECM"].values,
+    width=bar_width,
+    label="Epigeous ECM",
+    color=guild_colors["Epigeous_ECM"]
+)
+
+ax.set_xticks(x_positions)
+ax.set_xticklabels(month_labels)
+ax.set_xlabel("Month", fontsize=12)
+ax.set_ylabel("Detection frequency", fontsize=12)
+ax.set_ylim(0, 1)
+ax.set_title("Panel A. Detection frequency at 1.0% threshold", fontsize=13)
+ax.legend(frameon=False, fontsize=11)
+
+style_axes(ax)
+fig.tight_layout()
+
+panel_a_fp = plot_dir / "panel_A_month_detection_frequency_1pct.svg"
+fig.savefig(panel_a_fp, format="svg", bbox_inches="tight")
+plt.close(fig)
+
+# -----------------------------
+# Panel B: Pooled monthly richness
+# -----------------------------
+fig, ax = plt.subplots(figsize=(7, 5))
+
+ax.bar(
+    x_truffle,
+    richness_wide["Truffle"].values,
+    width=bar_width,
+    label="Truffle",
+    color=guild_colors["Truffle"]
+)
+
+ax.bar(
+    x_epigeous,
+    richness_wide["Epigeous_ECM"].values,
+    width=bar_width,
+    label="Epigeous ECM",
+    color=guild_colors["Epigeous_ECM"]
+)
+
+ax.set_xticks(x_positions)
+ax.set_xticklabels(month_labels)
+ax.set_xlabel("Month", fontsize=12)
+ax.set_ylabel("Pooled monthly OTU richness", fontsize=12)
+ax.set_ylim(bottom=0)
+ax.set_title("Panel B. Pooled OTU richness at 1.0% threshold", fontsize=13)
+ax.legend(frameon=False, fontsize=11)
+
+style_axes(ax)
+fig.tight_layout()
+
+panel_b_fp = plot_dir / "panel_B_month_pooled_richness_1pct.svg"
+fig.savefig(panel_b_fp, format="svg", bbox_inches="tight")
+plt.close(fig)
+
+# -----------------------------
+# Final console message
+# -----------------------------
+print("Done.")
+print(f"Saved: {panel_a_fp}")
+print(f"Saved: {panel_b_fp}")
+
