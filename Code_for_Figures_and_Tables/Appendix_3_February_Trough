@@ -1,0 +1,1099 @@
+### Diagnostic script for exploring low February truffle detections at Mckenzie
+```{r}
+# =============================================================================
+# Purpose
+# Diagnose whether the February decline in truffle detections at McKenzie Y2
+# is a true biological trough, a threshold-dependent pattern, or both.
+#
+# Inputs
+# - otu_table_collapsed_relative.csv
+# - guild_table_collapsed.csv
+# - metadata.csv
+#
+# Outputs
+# 1) Long summary table by Month x Threshold with:
+#    - total_samples
+#    - positive_samples
+#    - detection_frequency
+#    - mean_sample_level_richness
+#    - median_sample_level_richness
+#    - pooled_monthly_richness
+#    - mean_summed_truffle_RA
+#    - median_summed_truffle_RA
+# 2) Wide tables for quick month-by-threshold comparison
+# 3) Sample-level table for follow-up diagnostics
+# =============================================================================
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/february_truffle_diagnostics"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+thresholds  <- c(0.0, 0.2, 0.5, 1.0, 1.5)
+
+keep_site   <- "Mckenzie"
+keep_year   <- 2
+keep_nests  <- c("M1", "M3", "M6", "M8", "M9", "M10")
+keep_months <- c("December", "January", "February", "March", "April")
+
+# --------------------------------------------------
+# Read files
+# OTU table: rows = OTUs, columns = Sample_IDs, first column = OTU_ID
+# --------------------------------------------------
+otu_mat <- utils::read.csv(
+  file = otu_fp,
+  row.names = 1,
+  check.names = FALSE
+)
+
+guild <- readr::read_csv(
+  file = guild_fp,
+  show_col_types = FALSE
+)
+
+meta <- readr::read_csv(
+  file = meta_fp,
+  show_col_types = FALSE
+)
+
+# --------------------------------------------------
+# Clean metadata and restrict to McKenzie Year 2
+# IMPORTANT: use existing Month column from metadata
+# --------------------------------------------------
+meta_sub <- meta |>
+  dplyr::mutate(
+    Month = factor(as.character(Month), levels = keep_months, ordered = TRUE)
+  ) |>
+  dplyr::filter(
+    Site == keep_site,
+    Year == keep_year,
+    Nest_ID %in% keep_nests,
+    Month %in% keep_months
+  ) |>
+  dplyr::select(Sample_ID, Date_Collected, Month, Site, Year, Nest_ID)
+
+# --------------------------------------------------
+# Identify truffle OTUs from curated guild table
+# --------------------------------------------------
+truffle_ids <- guild |>
+  dplyr::filter(
+    primary_lifestyle == "ectomycorrhizal",
+    Fruitbody_type_template == "gasteroid-hypogeous"
+  ) |>
+  dplyr::pull(OTU_ID) |>
+  unique()
+
+# Keep only truffle OTUs that are actually present in OTU matrix
+truffle_ids <- intersect(truffle_ids, rownames(otu_mat))
+
+# --------------------------------------------------
+# Keep only metadata samples that actually exist in OTU matrix
+# --------------------------------------------------
+meta_sub <- meta_sub |>
+  dplyr::filter(Sample_ID %in% colnames(otu_mat))
+
+# --------------------------------------------------
+# Subset OTU matrix to truffle OTUs and target samples
+# --------------------------------------------------
+otu_truffle <- otu_mat[truffle_ids, meta_sub$Sample_ID, drop = FALSE]
+
+# --------------------------------------------------
+# Convert to sample-wise data frame
+# Rows = samples, columns = truffle OTUs
+# --------------------------------------------------
+otu_truffle_df <- as.data.frame(
+  x = t(otu_truffle),
+  check.names = FALSE
+)
+
+otu_truffle_df$Sample_ID <- rownames(otu_truffle_df)
+
+# --------------------------------------------------
+# Join metadata to sample-wise OTU table
+# --------------------------------------------------
+sample_df <- meta_sub |>
+  dplyr::left_join(otu_truffle_df, by = "Sample_ID")
+
+# --------------------------------------------------
+# Identify OTU columns and replace any NA with 0
+# --------------------------------------------------
+otu_cols <- setdiff(colnames(sample_df), c("Sample_ID", "Date_Collected", "Month", "Site", "Year", "Nest_ID"))
+
+sample_df[otu_cols] <- lapply(sample_df[otu_cols], function(x) {
+  x[is.na(x)] <- 0
+  as.numeric(x)
+})
+
+# --------------------------------------------------
+# Long-format OTU table for threshold calculations
+# --------------------------------------------------
+otu_long <- sample_df |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(otu_cols),
+    names_to = "OTU_ID",
+    values_to = "RA"
+  )
+
+# --------------------------------------------------
+# Sample-level summary at each threshold
+# For each sample:
+# - positive_sample: whether >=1 truffle OTU passes threshold
+# - sample_truffle_richness: number of truffle OTUs passing threshold
+# - summed_truffle_RA: sum of truffle relative abundance values that pass threshold
+# --------------------------------------------------
+sample_threshold_summary <- purrr::map_dfr(thresholds, function(thresh) {
+  otu_long |>
+    dplyr::mutate(
+      present = RA >= thresh
+    ) |>
+    dplyr::group_by(Sample_ID, Date_Collected, Month, Site, Year, Nest_ID) |>
+    dplyr::summarise(
+      threshold = thresh,
+      positive_sample = any(present),
+      sample_truffle_richness = sum(present, na.rm = TRUE),
+      summed_truffle_RA = sum(RA[RA >= thresh], na.rm = TRUE),
+      .groups = "drop"
+    )
+})
+
+# --------------------------------------------------
+# Pooled monthly richness at each threshold
+# Number of unique truffle OTUs detected across all samples within each month
+# --------------------------------------------------
+pooled_monthly_richness <- purrr::map_dfr(thresholds, function(thresh) {
+  otu_long |>
+    dplyr::filter(RA >= thresh) |>
+    dplyr::group_by(Month) |>
+    dplyr::summarise(
+      threshold = thresh,
+      pooled_monthly_richness = dplyr::n_distinct(OTU_ID),
+      .groups = "drop"
+    )
+})
+
+# Add zero rows for Month x Threshold combinations with no detections
+all_month_thresholds <- tidyr::expand_grid(
+  Month = factor(keep_months, levels = keep_months, ordered = TRUE),
+  threshold = thresholds
+)
+
+pooled_monthly_richness <- all_month_thresholds |>
+  dplyr::left_join(
+    pooled_monthly_richness,
+    by = c("Month", "threshold")
+  ) |>
+  dplyr::mutate(
+    pooled_monthly_richness = tidyr::replace_na(pooled_monthly_richness, 0L)
+  )
+
+# --------------------------------------------------
+# Main monthly summary table
+# --------------------------------------------------
+monthly_threshold_summary <- sample_threshold_summary |>
+  dplyr::group_by(Month, threshold) |>
+  dplyr::summarise(
+    total_samples = dplyr::n(),
+    positive_samples = sum(positive_sample, na.rm = TRUE),
+    detection_frequency = positive_samples / total_samples,
+    mean_sample_level_richness = mean(sample_truffle_richness, na.rm = TRUE),
+    median_sample_level_richness = stats::median(sample_truffle_richness, na.rm = TRUE),
+    mean_summed_truffle_RA = mean(summed_truffle_RA, na.rm = TRUE),
+    median_summed_truffle_RA = stats::median(summed_truffle_RA, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    pooled_monthly_richness,
+    by = c("Month", "threshold")
+  ) |>
+  dplyr::arrange(threshold, Month)
+
+# --------------------------------------------------
+# Wide tables for easier interpretation
+# --------------------------------------------------
+detection_frequency_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, detection_frequency) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = detection_frequency,
+    names_prefix = "thr_"
+  )
+
+positive_samples_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, positive_samples) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = positive_samples,
+    names_prefix = "thr_"
+  )
+
+mean_richness_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, mean_sample_level_richness) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = mean_sample_level_richness,
+    names_prefix = "thr_"
+  )
+
+median_richness_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, median_sample_level_richness) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = median_sample_level_richness,
+    names_prefix = "thr_"
+  )
+
+pooled_richness_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, pooled_monthly_richness) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = pooled_monthly_richness,
+    names_prefix = "thr_"
+  )
+
+mean_summed_ra_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, mean_summed_truffle_RA) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = mean_summed_truffle_RA,
+    names_prefix = "thr_"
+  )
+
+median_summed_ra_wide <- monthly_threshold_summary |>
+  dplyr::select(Month, threshold, median_summed_truffle_RA) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = median_summed_truffle_RA,
+    names_prefix = "thr_"
+  )
+
+# --------------------------------------------------
+# Save outputs
+# --------------------------------------------------
+readr::write_csv(
+  monthly_threshold_summary,
+  file.path(out_dir, "mckenzie_y2_truffle_monthly_threshold_summary_long.csv")
+)
+
+readr::write_csv(
+  detection_frequency_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_detection_frequency_wide.csv")
+)
+
+readr::write_csv(
+  positive_samples_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_positive_samples_wide.csv")
+)
+
+readr::write_csv(
+  mean_richness_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_mean_sample_richness_wide.csv")
+)
+
+readr::write_csv(
+  median_richness_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_median_sample_richness_wide.csv")
+)
+
+readr::write_csv(
+  pooled_richness_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_pooled_monthly_richness_wide.csv")
+)
+
+readr::write_csv(
+  mean_summed_ra_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_mean_summed_RA_wide.csv")
+)
+
+readr::write_csv(
+  median_summed_ra_wide,
+  file.path(out_dir, "mckenzie_y2_truffle_median_summed_RA_wide.csv")
+)
+
+readr::write_csv(
+  sample_threshold_summary,
+  file.path(out_dir, "mckenzie_y2_truffle_sample_threshold_summary.csv")
+)
+
+# --------------------------------------------------
+# Print tables to console
+# --------------------------------------------------
+cat("\n================ MAIN LONG TABLE ================\n")
+print(monthly_threshold_summary, n = Inf)
+
+cat("\n================ DETECTION FREQUENCY (WIDE) ================\n")
+print(detection_frequency_wide, n = Inf)
+
+cat("\n================ POSITIVE SAMPLES (WIDE) ================\n")
+print(positive_samples_wide, n = Inf)
+
+cat("\n================ MEAN SAMPLE-LEVEL RICHNESS (WIDE) ================\n")
+print(mean_richness_wide, n = Inf)
+
+cat("\n================ POOLED MONTHLY RICHNESS (WIDE) ================\n")
+print(pooled_richness_wide, n = Inf)
+
+cat("\n================ MEAN SUMMED TRUFFLE RA (WIDE) ================\n")
+print(mean_summed_ra_wide, n = Inf)
+
+cat("\nSaved outputs to:\n", out_dir, "\n")
+```
+
+
+### Diagnose whether the February truffle trough corresponds to shifts in the broader fungal community consumed by woodrats.
+
+```{r}
+# =============================================================================
+# Purpose
+# Diagnose whether the February truffle trough corresponds to shifts
+# in broader fungal community composition in McKenzie Year 2.
+#
+# Outputs
+# 1) monthly_guild_relative_abundance.csv
+# 2) monthly_guild_detection_frequency.csv
+# 3) monthly_guild_pooled_richness.csv
+# 4) sample_level_guild_relative_abundance.csv
+# =============================================================================
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/february_truffle_diagnostics"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+keep_site   <- "Mckenzie"
+keep_year   <- 2
+keep_nests  <- c("M1", "M3", "M6", "M8", "M9", "M10")
+keep_months <- c("December", "January", "February", "March", "April")
+
+threshold <- 0.2
+
+# --------------------------------------------------
+# Read files
+# --------------------------------------------------
+otu_mat <- utils::read.csv(
+  file = otu_fp,
+  row.names = 1,
+  check.names = FALSE
+)
+
+guild <- readr::read_csv(
+  file = guild_fp,
+  show_col_types = FALSE
+)
+
+meta <- readr::read_csv(
+  file = meta_fp,
+  show_col_types = FALSE
+)
+
+# --------------------------------------------------
+# Metadata filtering
+# --------------------------------------------------
+meta_sub <- meta |>
+  dplyr::mutate(
+    Month = factor(as.character(Month), levels = keep_months, ordered = TRUE)
+  ) |>
+  dplyr::filter(
+    Site == keep_site,
+    Year == keep_year,
+    Nest_ID %in% keep_nests,
+    Month %in% keep_months
+  ) |>
+  dplyr::select(Sample_ID, Date_Collected, Month, Site, Year, Nest_ID)
+
+# --------------------------------------------------
+# Restrict to samples present in OTU table
+# --------------------------------------------------
+meta_sub <- meta_sub |>
+  dplyr::filter(Sample_ID %in% colnames(otu_mat))
+
+otu_sub <- otu_mat[, meta_sub$Sample_ID, drop = FALSE]
+
+# --------------------------------------------------
+# Long OTU table
+# --------------------------------------------------
+otu_long <- otu_sub |>
+  as.data.frame(check.names = FALSE) |>
+  tibble::rownames_to_column("OTU_ID") |>
+  tidyr::pivot_longer(
+    cols = -OTU_ID,
+    names_to = "Sample_ID",
+    values_to = "RA"
+  )
+
+# --------------------------------------------------
+# Attach metadata and guild info
+# --------------------------------------------------
+otu_long <- otu_long |>
+  dplyr::left_join(meta_sub, by = "Sample_ID") |>
+  dplyr::left_join(
+    guild |>
+      dplyr::select(OTU_ID, primary_lifestyle, Fruitbody_type_template),
+    by = "OTU_ID"
+  )
+
+# --------------------------------------------------
+# Collapse lifestyles into analysis categories
+# --------------------------------------------------
+otu_long <- otu_long |>
+  dplyr::mutate(
+    guild_group = dplyr::case_when(
+      primary_lifestyle == "ectomycorrhizal" &
+        Fruitbody_type_template == "gasteroid-hypogeous" ~ "ECM_truffle",
+
+      primary_lifestyle == "ectomycorrhizal" &
+        Fruitbody_type_template != "gasteroid-hypogeous" ~ "ECM_epigeous",
+
+      primary_lifestyle %in% c(
+        "dung_saprotroph",
+        "litter_saprotroph",
+        "nectar/tap_saprotroph",
+        "pollen_saprotroph",
+        "soil_saprotroph",
+        "unspecified_saprotroph",
+        "wood_saprotroph"
+      ) ~ "saprotroph_all",
+
+      primary_lifestyle %in% c(
+        "foliar_endophyte",
+        "root_endophyte"
+      ) ~ "endophyte_all",
+
+      primary_lifestyle %in% c(
+        "animal_endosymbiont",
+        "animal_parasite"
+      ) ~ "animal_associated",
+
+      primary_lifestyle == "plant_pathogen" ~ "plant_pathogen",
+      primary_lifestyle == "mycoparasite" ~ "mycoparasite",
+      is.na(primary_lifestyle) ~ "NA_lifestyle",
+      TRUE ~ "other"
+    )
+  )
+
+# --------------------------------------------------
+# Sample-level guild RA
+# This is useful if we later want to see whether February samples
+# are dominated by a particular guild.
+# --------------------------------------------------
+sample_level_guild_RA <- otu_long |>
+  dplyr::group_by(Sample_ID, Month, Nest_ID, guild_group) |>
+  dplyr::summarise(
+    total_RA = sum(RA, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --------------------------------------------------
+# Monthly guild relative abundance
+# Mean and median across samples
+# --------------------------------------------------
+monthly_guild_RA <- sample_level_guild_RA |>
+  dplyr::group_by(Month, guild_group) |>
+  dplyr::summarise(
+    mean_total_RA = mean(total_RA, na.rm = TRUE),
+    median_total_RA = stats::median(total_RA, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(Month, guild_group)
+
+# --------------------------------------------------
+# Detection frequency by guild
+# A sample is positive if >= 1 OTU in that guild reaches threshold
+# --------------------------------------------------
+sample_level_guild_detection <- otu_long |>
+  dplyr::mutate(detected = RA >= threshold) |>
+  dplyr::group_by(Sample_ID, Month, Nest_ID, guild_group) |>
+  dplyr::summarise(
+    positive_sample = any(detected),
+    .groups = "drop"
+  )
+
+monthly_guild_detection <- sample_level_guild_detection |>
+  dplyr::group_by(Month, guild_group) |>
+  dplyr::summarise(
+    positive_samples = sum(positive_sample, na.rm = TRUE),
+    total_samples_with_group_entry = dplyr::n(),
+    detection_frequency = positive_samples / total_samples_with_group_entry,
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(Month, guild_group)
+
+# --------------------------------------------------
+# Pooled monthly richness by guild
+# Number of OTUs in each guild reaching threshold in each month
+# --------------------------------------------------
+monthly_guild_pooled_richness <- otu_long |>
+  dplyr::filter(RA >= threshold) |>
+  dplyr::group_by(Month, guild_group) |>
+  dplyr::summarise(
+    pooled_richness = dplyr::n_distinct(OTU_ID),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(Month, guild_group)
+
+# --------------------------------------------------
+# Save outputs
+# --------------------------------------------------
+readr::write_csv(
+  sample_level_guild_RA,
+  file.path(out_dir, "sample_level_guild_relative_abundance.csv")
+)
+
+readr::write_csv(
+  monthly_guild_RA,
+  file.path(out_dir, "monthly_guild_relative_abundance.csv")
+)
+
+readr::write_csv(
+  monthly_guild_detection,
+  file.path(out_dir, "monthly_guild_detection_frequency.csv")
+)
+
+readr::write_csv(
+  monthly_guild_pooled_richness,
+  file.path(out_dir, "monthly_guild_pooled_richness.csv")
+)
+```
+
+### # Identify which saprotroph lifestyles dominate February in McKenzie Year 2
+```{r}
+# =============================================================================
+# Purpose
+# Diagnose which saprotroph component lifestyles dominate February in
+# McKenzie Year 2, while preserving the same threshold-explicit logic used
+# for the truffle diagnostics.
+#
+# Outputs
+# 1) monthly_saprotroph_component_relative_abundance.csv
+#    - no threshold; mean and median total RA by month and saprotroph lifestyle
+#
+# 2) monthly_saprotroph_component_threshold_summary_long.csv
+#    - month x threshold x saprotroph lifestyle summary with:
+#      total_samples
+#      positive_samples
+#      detection_frequency
+#      mean_sample_level_richness
+#      median_sample_level_richness
+#      pooled_monthly_richness
+#      mean_summed_RA
+#      median_summed_RA
+#
+# 3) wide CSVs for quick comparison across thresholds
+# 4) sample-level threshold summary for follow-up diagnostics
+# =============================================================================
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/february_truffle_diagnostics"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+thresholds  <- c(0.0, 0.2, 0.5, 1.0, 1.5)
+
+keep_site   <- "Mckenzie"
+keep_year   <- 2
+keep_nests  <- c("M1", "M3", "M6", "M8", "M9", "M10")
+keep_months <- c("December", "January", "February", "March", "April")
+
+saprotroph_levels <- c(
+  "dung_saprotroph",
+  "litter_saprotroph",
+  "nectar/tap_saprotroph",
+  "pollen_saprotroph",
+  "soil_saprotroph",
+  "unspecified_saprotroph",
+  "wood_saprotroph"
+)
+
+# --------------------------------------------------
+# Read files
+# --------------------------------------------------
+otu_mat <- utils::read.csv(
+  file = otu_fp,
+  row.names = 1,
+  check.names = FALSE
+)
+
+guild <- readr::read_csv(
+  file = guild_fp,
+  show_col_types = FALSE
+)
+
+meta <- readr::read_csv(
+  file = meta_fp,
+  show_col_types = FALSE
+)
+
+# --------------------------------------------------
+# Metadata filtering
+# IMPORTANT: use existing Month column from metadata
+# --------------------------------------------------
+meta_sub <- meta |>
+  dplyr::mutate(
+    Month = factor(as.character(Month), levels = keep_months, ordered = TRUE)
+  ) |>
+  dplyr::filter(
+    Site == keep_site,
+    Year == keep_year,
+    Nest_ID %in% keep_nests,
+    Month %in% keep_months
+  ) |>
+  dplyr::select(Sample_ID, Date_Collected, Month, Site, Year, Nest_ID)
+
+# --------------------------------------------------
+# Restrict to samples present in OTU table
+# --------------------------------------------------
+meta_sub <- meta_sub |>
+  dplyr::filter(Sample_ID %in% colnames(otu_mat))
+
+otu_sub <- otu_mat[, meta_sub$Sample_ID, drop = FALSE]
+
+# --------------------------------------------------
+# Long OTU table
+# --------------------------------------------------
+otu_long <- otu_sub |>
+  as.data.frame(check.names = FALSE) |>
+  tibble::rownames_to_column("OTU_ID") |>
+  tidyr::pivot_longer(
+    cols = -OTU_ID,
+    names_to = "Sample_ID",
+    values_to = "RA"
+  )
+
+# --------------------------------------------------
+# Attach metadata and guild info
+# --------------------------------------------------
+otu_long <- otu_long |>
+  dplyr::left_join(meta_sub, by = "Sample_ID") |>
+  dplyr::left_join(
+    guild |>
+      dplyr::select(OTU_ID, primary_lifestyle),
+    by = "OTU_ID"
+  )
+
+# --------------------------------------------------
+# Keep only saprotroph component lifestyles
+# --------------------------------------------------
+sap_long <- otu_long |>
+  dplyr::filter(primary_lifestyle %in% saprotroph_levels)
+
+# --------------------------------------------------
+# Sample-level relative abundance with NO threshold
+# This answers: which saprotroph lifestyles dominate in raw abundance?
+# --------------------------------------------------
+sample_sap_ra <- sap_long |>
+  dplyr::group_by(Sample_ID, Month, Nest_ID, primary_lifestyle) |>
+  dplyr::summarise(
+    total_RA = sum(RA, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+monthly_sap_ra <- sample_sap_ra |>
+  dplyr::group_by(Month, primary_lifestyle) |>
+  dplyr::summarise(
+    mean_total_RA = mean(total_RA, na.rm = TRUE),
+    median_total_RA = stats::median(total_RA, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(Month, dplyr::desc(mean_total_RA))
+
+# --------------------------------------------------
+# Sample-level summaries across all thresholds
+# For each sample and saprotroph lifestyle:
+# - positive_sample = at least one OTU >= threshold
+# - sample_level_richness = number of OTUs >= threshold
+# - summed_RA = sum of OTU RAs >= threshold
+# --------------------------------------------------
+sample_sap_threshold_summary <- purrr::map_dfr(thresholds, function(thresh) {
+  sap_long |>
+    dplyr::mutate(
+      present = RA >= thresh
+    ) |>
+    dplyr::group_by(Sample_ID, Month, Nest_ID, primary_lifestyle) |>
+    dplyr::summarise(
+      threshold = thresh,
+      positive_sample = any(present),
+      sample_level_richness = sum(present, na.rm = TRUE),
+      summed_RA = sum(RA[RA >= thresh], na.rm = TRUE),
+      .groups = "drop"
+    )
+})
+
+# --------------------------------------------------
+# Create complete grid so zero-detection combinations are retained
+# --------------------------------------------------
+all_sample_lifestyle_threshold <- tidyr::expand_grid(
+  Sample_ID = unique(meta_sub$Sample_ID),
+  primary_lifestyle = saprotroph_levels,
+  threshold = thresholds
+) |>
+  dplyr::left_join(
+    meta_sub |>
+      dplyr::select(Sample_ID, Month, Nest_ID),
+    by = "Sample_ID"
+  )
+
+sample_sap_threshold_summary <- all_sample_lifestyle_threshold |>
+  dplyr::left_join(
+    sample_sap_threshold_summary,
+    by = c("Sample_ID", "Month", "Nest_ID", "primary_lifestyle", "threshold")
+  ) |>
+  dplyr::mutate(
+    positive_sample = tidyr::replace_na(positive_sample, FALSE),
+    sample_level_richness = tidyr::replace_na(sample_level_richness, 0L),
+    summed_RA = tidyr::replace_na(summed_RA, 0)
+  )
+
+# --------------------------------------------------
+# Pooled monthly richness across thresholds
+# Number of unique OTUs in each saprotroph lifestyle detected within each month
+# --------------------------------------------------
+pooled_sap_monthly_richness <- purrr::map_dfr(thresholds, function(thresh) {
+  sap_long |>
+    dplyr::filter(RA >= thresh) |>
+    dplyr::group_by(Month, primary_lifestyle) |>
+    dplyr::summarise(
+      threshold = thresh,
+      pooled_monthly_richness = dplyr::n_distinct(OTU_ID),
+      .groups = "drop"
+    )
+})
+
+all_month_lifestyle_threshold <- tidyr::expand_grid(
+  Month = factor(keep_months, levels = keep_months, ordered = TRUE),
+  primary_lifestyle = saprotroph_levels,
+  threshold = thresholds
+)
+
+pooled_sap_monthly_richness <- all_month_lifestyle_threshold |>
+  dplyr::left_join(
+    pooled_sap_monthly_richness,
+    by = c("Month", "primary_lifestyle", "threshold")
+  ) |>
+  dplyr::mutate(
+    pooled_monthly_richness = tidyr::replace_na(pooled_monthly_richness, 0L)
+  )
+
+# --------------------------------------------------
+# Main monthly threshold summary
+# --------------------------------------------------
+monthly_sap_threshold_summary <- sample_sap_threshold_summary |>
+  dplyr::group_by(Month, primary_lifestyle, threshold) |>
+  dplyr::summarise(
+    total_samples = dplyr::n(),
+    positive_samples = sum(positive_sample, na.rm = TRUE),
+    detection_frequency = positive_samples / total_samples,
+    mean_sample_level_richness = mean(sample_level_richness, na.rm = TRUE),
+    median_sample_level_richness = stats::median(sample_level_richness, na.rm = TRUE),
+    mean_summed_RA = mean(summed_RA, na.rm = TRUE),
+    median_summed_RA = stats::median(summed_RA, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    pooled_sap_monthly_richness,
+    by = c("Month", "primary_lifestyle", "threshold")
+  ) |>
+  dplyr::arrange(primary_lifestyle, threshold, Month)
+
+# --------------------------------------------------
+# Wide tables for quick comparison across thresholds
+# --------------------------------------------------
+sap_detection_wide <- monthly_sap_threshold_summary |>
+  dplyr::select(Month, primary_lifestyle, threshold, detection_frequency) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = detection_frequency,
+    names_prefix = "thr_"
+  )
+
+sap_positive_wide <- monthly_sap_threshold_summary |>
+  dplyr::select(Month, primary_lifestyle, threshold, positive_samples) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = positive_samples,
+    names_prefix = "thr_"
+  )
+
+sap_mean_richness_wide <- monthly_sap_threshold_summary |>
+  dplyr::select(Month, primary_lifestyle, threshold, mean_sample_level_richness) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = mean_sample_level_richness,
+    names_prefix = "thr_"
+  )
+
+sap_pooled_richness_wide <- monthly_sap_threshold_summary |>
+  dplyr::select(Month, primary_lifestyle, threshold, pooled_monthly_richness) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = pooled_monthly_richness,
+    names_prefix = "thr_"
+  )
+
+sap_mean_summed_RA_wide <- monthly_sap_threshold_summary |>
+  dplyr::select(Month, primary_lifestyle, threshold, mean_summed_RA) |>
+  tidyr::pivot_wider(
+    names_from = threshold,
+    values_from = mean_summed_RA,
+    names_prefix = "thr_"
+  )
+
+# --------------------------------------------------
+# Save outputs
+# --------------------------------------------------
+readr::write_csv(
+  monthly_sap_ra,
+  file.path(out_dir, "monthly_saprotroph_component_relative_abundance.csv")
+)
+
+readr::write_csv(
+  sample_sap_ra,
+  file.path(out_dir, "sample_level_saprotroph_component_relative_abundance.csv")
+)
+
+readr::write_csv(
+  monthly_sap_threshold_summary,
+  file.path(out_dir, "monthly_saprotroph_component_threshold_summary_long.csv")
+)
+
+readr::write_csv(
+  sample_sap_threshold_summary,
+  file.path(out_dir, "sample_level_saprotroph_component_threshold_summary.csv")
+)
+
+readr::write_csv(
+  sap_detection_wide,
+  file.path(out_dir, "monthly_saprotroph_component_detection_frequency_wide.csv")
+)
+
+readr::write_csv(
+  sap_positive_wide,
+  file.path(out_dir, "monthly_saprotroph_component_positive_samples_wide.csv")
+)
+
+readr::write_csv(
+  sap_mean_richness_wide,
+  file.path(out_dir, "monthly_saprotroph_component_mean_sample_richness_wide.csv")
+)
+
+readr::write_csv(
+  sap_pooled_richness_wide,
+  file.path(out_dir, "monthly_saprotroph_component_pooled_monthly_richness_wide.csv")
+)
+
+readr::write_csv(
+  sap_mean_summed_RA_wide,
+  file.path(out_dir, "monthly_saprotroph_component_mean_summed_RA_wide.csv")
+)
+```
+
+
+
+#### PLOT SUPPLEMENTAL FIGURES: APPENDIX 3, SUPP. FIGURES 1 & 2 
+
+
+"""
+Purpose:
+Create two supplemental figures illustrating the February pattern in fungal
+detections from woodrat pellets.
+
+Outputs:
+Both figures are exported as SVG and JPG to the same diagnostics directory.
+
+Figure S1:
+Monthly mean summed truffle relative abundance using NO threshold.
+
+Figure S2:
+Monthly mean relative abundance for three guild groups:
+ECM_truffle, ECM_epigeous, saprotroph_all.
+"""
+
+# --------------------------------------------------
+# Imports
+# --------------------------------------------------
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+out_dir = "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/february_truffle_diagnostics"
+
+truffle_fp = os.path.join(
+    out_dir,
+    "mckenzie_y2_truffle_monthly_threshold_summary_long.csv"
+)
+
+guild_fp = os.path.join(
+    out_dir,
+    "monthly_guild_relative_abundance.csv"
+)
+
+# --------------------------------------------------
+# Output figure paths
+# --------------------------------------------------
+fig1_svg = os.path.join(out_dir, "Figure_S1_february_truffle_trough.svg")
+fig1_jpg = os.path.join(out_dir, "Figure_S1_february_truffle_trough.jpg")
+
+fig2_svg = os.path.join(out_dir, "Figure_S2_monthly_ECM_vs_saprotrophs.svg")
+fig2_jpg = os.path.join(out_dir, "Figure_S2_monthly_ECM_vs_saprotrophs.jpg")
+
+# --------------------------------------------------
+# Month order
+# --------------------------------------------------
+month_order = ["December", "January", "February", "March", "April"]
+
+# --------------------------------------------------
+# Colors
+# --------------------------------------------------
+COLORS = {
+    "ECM_truffle": "#0072B2",
+    "ECM_epigeous": "#009E73",
+    "saprotroph_all": "#D55E00",
+    "truffle_single": "#0072B2"
+}
+
+# --------------------------------------------------
+# Read data
+# --------------------------------------------------
+truffle_df = pd.read_csv(truffle_fp)
+guild_df = pd.read_csv(guild_fp)
+
+# --------------------------------------------------
+# Prepare Figure S1 data
+# --------------------------------------------------
+truffle_s1 = truffle_df.loc[
+    truffle_df["threshold"] == 0.0,
+    ["Month", "mean_summed_truffle_RA"]
+].copy()
+
+truffle_s1["Month"] = pd.Categorical(
+    truffle_s1["Month"],
+    categories=month_order,
+    ordered=True
+)
+
+truffle_s1 = truffle_s1.sort_values("Month")
+
+# --------------------------------------------------
+# Prepare Figure S2 data
+# --------------------------------------------------
+guild_keep = ["ECM_truffle", "ECM_epigeous", "saprotroph_all"]
+
+guild_s2 = guild_df.loc[
+    guild_df["guild_group"].isin(guild_keep),
+    ["Month", "guild_group", "mean_total_RA"]
+].copy()
+
+guild_s2["Month"] = pd.Categorical(
+    guild_s2["Month"],
+    categories=month_order,
+    ordered=True
+)
+
+guild_s2 = guild_s2.sort_values(["guild_group", "Month"])
+
+# ==================================================
+# Figure S1
+# ==================================================
+fig, ax = plt.subplots(figsize=(7, 4.5))
+
+ax.plot(
+    truffle_s1["Month"].astype(str),
+    truffle_s1["mean_summed_truffle_RA"],
+    marker="o",
+    linewidth=2,
+    markersize=6,
+    color=COLORS["truffle_single"]
+)
+
+ax.set_xlabel("Month")
+ax.set_ylabel("Mean summed truffle relative abundance")
+ax.set_title("Figure S1. February trough in truffle relative abundance")
+
+ax.grid(False)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+fig.tight_layout()
+
+fig.savefig(fig1_svg, format="svg", bbox_inches="tight")
+fig.savefig(fig1_jpg, format="jpg", dpi=600, bbox_inches="tight")
+
+plt.close(fig)
+
+# ==================================================
+# Figure S2
+# ==================================================
+fig, ax = plt.subplots(figsize=(7.5, 5))
+
+for g in guild_keep:
+
+    subset = guild_s2[guild_s2["guild_group"] == g].copy()
+    subset = subset.sort_values("Month")
+
+    ax.plot(
+        subset["Month"].astype(str),
+        subset["mean_total_RA"],
+        marker="o",
+        linewidth=2,
+        markersize=6,
+        color=COLORS[g],
+        label=g
+    )
+
+ax.set_xlabel("Month")
+ax.set_ylabel("Mean relative abundance")
+
+label_map = {
+    "ECM_truffle": "Truffle ECM",
+    "ECM_epigeous": "Epigeous ECM",
+    "saprotroph_all": "Saprotrophs"
+}
+
+handles, labels = ax.get_legend_handles_labels()
+labels = [label_map[x] for x in labels]
+
+ax.legend(handles, labels, frameon=False)
+
+ax.set_title("Figure S2. Monthly shift from ECM fungi to saprotrophs")
+
+ax.grid(False)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+fig.tight_layout()
+
+fig.savefig(fig2_svg, format="svg", bbox_inches="tight")
+fig.savefig(fig2_jpg, format="jpg", dpi=600, bbox_inches="tight")
+
+plt.close(fig)
+
+print("Figures saved:")
+print(fig1_svg)
+print(fig1_jpg)
+print(fig2_svg)
+print(fig2_jpg)
