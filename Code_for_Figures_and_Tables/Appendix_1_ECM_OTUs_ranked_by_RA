@@ -1,3 +1,272 @@
+
+
+```{r}
+################################################################################
+# PURPOSE:
+#   Build supplemental OTU detection tables across all thresholds using the
+#   full dataset. No filtering by site, nest, month, or year is applied.
+#
+#   The script identifies which truffle and epigeous ECM OTUs were detected at
+#   each threshold across all samples in the full relative-abundance table.
+#
+# INPUTS:
+#   1) otu_table_collapsed_relative.csv
+#   2) guild_table_collapsed.csv
+#
+# OUTPUTS:
+#   1) full_dataset_otu_detection_summary_all_thresholds.csv
+#      - long table: one row per Threshold × Guild × OTU_ID
+#   2) full_dataset_otu_detection_presence_matrix_all_thresholds.csv
+#      - wide table: one row per OTU, one column per threshold
+#
+# THRESHOLDS:
+#   - 0.0  -> interpreted as RA > 0
+#   - 0.2  -> interpreted as RA >= 0.2
+#   - 0.5  -> interpreted as RA >= 0.5
+#   - 1.0  -> interpreted as RA >= 1.0
+#   - 1.5  -> interpreted as RA >= 1.5
+#
+# NOTES:
+#   - Relative abundance values are percentages summing to ~100 per sample.
+#   - Detection here means an OTU met the threshold in at least one sample.
+################################################################################
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/full_dataset_threshold_otu_summary"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# --------------------------------------------------
+# Parameters
+# --------------------------------------------------
+thresholds <- c(0.0, 0.2, 0.5, 1.0, 1.5)
+
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
+otu   <- readr::read_csv(otu_fp, show_col_types = FALSE)
+guild <- readr::read_csv(guild_fp, show_col_types = FALSE)
+
+# --------------------------------------------------
+# Basic checks
+# --------------------------------------------------
+stopifnot("OTU_ID" %in% names(otu))
+stopifnot(all(c("OTU_ID", "primary_lifestyle", "Fruitbody_type_template") %in% names(guild)))
+
+# --------------------------------------------------
+# Define guild membership EXACTLY
+# --------------------------------------------------
+truffle_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template == "gasteroid-hypogeous"
+)
+
+truffle_ids <- unique(truffle_tbl$OTU_ID)
+
+epigeous_tbl <- dplyr::filter(
+  guild,
+  primary_lifestyle == "ectomycorrhizal",
+  Fruitbody_type_template %in% c(
+    "agaricoid",
+    "gasteroid",
+    "clavarioid",
+    "apothecium_(hymenium_on_surface)"
+  )
+)
+
+epigeous_ids <- unique(epigeous_tbl$OTU_ID)
+
+# --------------------------------------------------
+# Build taxonomy table for focal guild OTUs
+# --------------------------------------------------
+truffle_tax <- dplyr::filter(guild, OTU_ID %in% truffle_ids)
+
+truffle_tax <- dplyr::select(
+  truffle_tax,
+  OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+truffle_tax <- dplyr::mutate(truffle_tax, Guild = "Truffle")
+
+epigeous_tax <- dplyr::filter(guild, OTU_ID %in% epigeous_ids)
+
+epigeous_tax <- dplyr::select(
+  epigeous_tax,
+  OTU_ID, Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template
+)
+
+epigeous_tax <- dplyr::mutate(epigeous_tax, Guild = "Epigeous_ECM")
+
+guild_tax <- dplyr::bind_rows(truffle_tax, epigeous_tax)
+guild_tax <- dplyr::distinct(guild_tax)
+
+# --------------------------------------------------
+# Build long OTU table for all samples
+# --------------------------------------------------
+otu_samples <- setdiff(colnames(otu), "OTU_ID")
+
+otu_long <- tidyr::pivot_longer(
+  otu,
+  cols = dplyr::all_of(otu_samples),
+  names_to = "Sample_ID",
+  values_to = "RA"
+)
+
+otu_long$RA[is.na(otu_long$RA)] <- 0
+
+otu_long <- dplyr::mutate(
+  otu_long,
+  Guild = dplyr::case_when(
+    OTU_ID %in% truffle_ids ~ "Truffle",
+    OTU_ID %in% epigeous_ids ~ "Epigeous_ECM",
+    TRUE ~ NA_character_
+  )
+)
+
+otu_long <- dplyr::filter(otu_long, !is.na(Guild))
+
+otu_long <- dplyr::left_join(
+  otu_long,
+  guild_tax,
+  by = c("OTU_ID", "Guild")
+)
+
+# --------------------------------------------------
+# Build long threshold summary table
+# --------------------------------------------------
+otu_threshold_list <- list()
+
+for (i in seq_along(thresholds)) {
+
+  th <- thresholds[i]
+  tmp <- otu_long
+
+  if (th == 0) {
+    tmp <- dplyr::mutate(tmp, Detected = RA > 0)
+  } else {
+    tmp <- dplyr::mutate(tmp, Detected = RA >= th)
+  }
+
+  tmp <- dplyr::filter(tmp, Detected)
+
+  tmp <- dplyr::group_by(
+    tmp,
+    OTU_ID, Guild,
+    Kingdom, Phylum, Class, Order, Family, Genus, Species,
+    primary_lifestyle, Fruitbody_type_template
+  )
+
+  tmp <- dplyr::summarise(
+    tmp,
+    Samples_Detected = dplyr::n_distinct(Sample_ID),
+    Mean_RA_When_Detected = mean(RA, na.rm = TRUE),
+    Median_RA_When_Detected = stats::median(RA, na.rm = TRUE),
+    Max_RA_When_Detected = max(RA, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+  tmp <- dplyr::mutate(
+    tmp,
+    Threshold = th,
+    Detected_At_Threshold = 1L
+  )
+
+  otu_threshold_list[[i]] <- tmp
+}
+
+otu_detection_summary_all_thresholds <- dplyr::bind_rows(otu_threshold_list)
+
+otu_detection_summary_all_thresholds <- dplyr::select(
+  otu_detection_summary_all_thresholds,
+  Threshold, Guild, OTU_ID,
+  Kingdom, Phylum, Class, Order, Family, Genus, Species,
+  primary_lifestyle, Fruitbody_type_template,
+  Samples_Detected,
+  Mean_RA_When_Detected,
+  Median_RA_When_Detected,
+  Max_RA_When_Detected,
+  Detected_At_Threshold
+)
+
+otu_detection_summary_all_thresholds <- dplyr::arrange(
+  otu_detection_summary_all_thresholds,
+  Threshold,
+  Guild,
+  dplyr::desc(Samples_Detected),
+  OTU_ID
+)
+
+readr::write_csv(
+  otu_detection_summary_all_thresholds,
+  file.path(out_dir, "full_dataset_otu_detection_summary_all_thresholds.csv")
+)
+
+# --------------------------------------------------
+# Build wide presence-by-threshold matrix
+# --------------------------------------------------
+otu_presence_matrix <- dplyr::select(
+  otu_detection_summary_all_thresholds,
+  OTU_ID, Guild, Genus, Species, Threshold, Detected_At_Threshold
+)
+
+otu_presence_matrix <- dplyr::mutate(
+  otu_presence_matrix,
+  Threshold_Label = dplyr::case_when(
+    Threshold == 0.0 ~ "Detected_at_0.0",
+    Threshold == 0.2 ~ "Detected_at_0.2",
+    Threshold == 0.5 ~ "Detected_at_0.5",
+    Threshold == 1.0 ~ "Detected_at_1.0",
+    Threshold == 1.5 ~ "Detected_at_1.5",
+    TRUE ~ paste0("Detected_at_", Threshold)
+  )
+)
+
+otu_presence_matrix <- tidyr::pivot_wider(
+  otu_presence_matrix,
+  id_cols = c(OTU_ID, Guild, Genus, Species),
+  names_from = Threshold_Label,
+  values_from = Detected_At_Threshold,
+  values_fill = 0
+)
+
+otu_presence_matrix <- dplyr::arrange(
+  otu_presence_matrix,
+  Guild,
+  OTU_ID
+)
+
+readr::write_csv(
+  otu_presence_matrix,
+  file.path(out_dir, "full_dataset_otu_detection_presence_matrix_all_thresholds.csv")
+)
+
+# --------------------------------------------------
+# Final messages
+# --------------------------------------------------
+message("Done.")
+message("Saved:")
+message("  full_dataset_otu_detection_summary_all_thresholds.csv")
+message("  full_dataset_otu_detection_presence_matrix_all_thresholds.csv")
+```
+
+
+
+##### Script to make clean docx table
+
+
+
 """
 PURPOSE
 Create a cleaner DOCX supplemental table listing truffle and epigeous ECM OTUs
