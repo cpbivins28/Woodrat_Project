@@ -1,0 +1,760 @@
+####
+#### Larrick (Panorama Park) vs McKenzie
+####
+
+### Build summary table 
+```{r}
+# ================================================================
+# Create per-sample guild detection summaries for site comparison
+# ================================================================
+
+# Load required packages
+library(tidyverse)
+library(lubridate)
+
+# ------------------------------------------------
+# File paths
+# ------------------------------------------------
+otu_fp   <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/otu_table_collapsed_relative.csv"
+guild_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/guild_table_collapsed.csv"
+meta_fp  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/working_data/metadata.csv"
+
+# Output directory and file path
+out_dir  <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Larrick_vs_Mckenzie"
+out_fp   <- file.path(out_dir, "site_comparison_summary.csv")
+
+# Create output directory if missing
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ------------------------------------------------
+# Read input data
+# ------------------------------------------------
+otu   <- read_csv(otu_fp, show_col_types = FALSE)
+guild <- read_csv(guild_fp, show_col_types = FALSE)
+meta  <- read_csv(meta_fp, show_col_types = FALSE)
+
+# ------------------------------------------------
+# Define and filter target guilds
+# ------------------------------------------------
+guild_filtered <- guild %>%
+  filter(primary_lifestyle == "ectomycorrhizal") %>%
+  mutate(
+    Guild = case_when(
+      Fruitbody_type_template == "gasteroid-hypogeous" ~ "Truffle",
+      Fruitbody_type_template %in% c(
+        "agaricoid",
+        "gasteroid",
+        "clavarioid",
+        "apothecium_(hymenium_on_surface)"
+      ) ~ "Epigeous_ECM",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Exclude undesired taxa
+  filter(!(Genus %in% c("Pulvinula", "Geopora"))) %>%
+  filter(OTU_ID != "OTU2849") %>%
+  filter(!is.na(Guild)) %>%
+  select(OTU_ID, Guild)
+
+# ------------------------------------------------
+# Join guild info to OTU table
+# ------------------------------------------------
+otu_guilded <- otu %>%
+  rename(OTU_ID = 1) %>%
+  inner_join(guild_filtered, by = "OTU_ID")
+
+# ------------------------------------------------
+# Define detection thresholds (in % RA)
+# ------------------------------------------------
+thresholds <- c(0.2, 0.5, 1.0, 1.5)
+
+# ------------------------------------------------
+# Compute per-sample richness and detection frequency
+# ------------------------------------------------
+summaries <- list()
+
+for (t in thresholds) {
+  temp <- otu_guilded %>%
+    pivot_longer(
+      cols = -c(OTU_ID, Guild),
+      names_to = "Sample_ID",
+      values_to = "RA"
+    ) %>%
+    group_by(Guild, Sample_ID) %>%
+    summarise(
+      Richness = sum(RA >= t, na.rm = TRUE),
+      Detection_Freq = Richness / n(),
+      .groups = "drop"
+    ) %>%
+    mutate(Threshold = t)
+
+  summaries[[as.character(t)]] <- temp
+}
+
+summary_all <- bind_rows(summaries)
+
+# ------------------------------------------------
+# Merge metadata and finalize
+# ------------------------------------------------
+summary_meta <- summary_all %>%
+  left_join(meta, by = "Sample_ID") %>%
+  # Exclude any samples with missing or undetermined metadata
+  filter(!is.na(Site), Site != "Undetermined") %>%
+  mutate(
+    Date_Collected = lubridate::mdy(Date_Collected),
+    Month = month(Date_Collected, label = TRUE, abbr = FALSE)
+  ) %>%
+  select(
+    Sample_ID,
+    Site,
+    Nest_ID,
+    Date_Collected,
+    Month,
+    Guild,
+    Threshold,
+    Richness,
+    Detection_Freq
+  )
+
+# ------------------------------------------------
+# Export final summary table
+# ------------------------------------------------
+write_csv(summary_meta, out_fp)
+message("✅ Summary table saved to: ", out_fp)
+
+# ------------------------------------------------
+# Quick sanity check (optional)
+# ------------------------------------------------
+print(summary_meta %>% sample_n(10))
+
+```
+
+
+# Compare Truffle vs Epigeous ECM consumption between Larrick & McKenzie
+# (Paired March–April 2024 sampling weeks)
+```{r}
+# ================================================================
+# Summarize Truffle vs Epigeous ECM consumption between Larrick & Mckenzie
+# (Paired March–April 2024 sampling weeks)
+# Exports CSV summaries for Python plotting
+# ================================================================
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+
+# ------------------------------------------------
+# File paths
+# ------------------------------------------------
+data_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Larrick_vs_Mckenzie/overlapping_months_same_year/site_comparison_summary.csv"
+out_dir <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Larrick_vs_Mckenzie/overlapping_months_same_year"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ------------------------------------------------
+# Load and standardize data
+# ------------------------------------------------
+df <- read_csv(data_fp, show_col_types = FALSE) %>%
+  # Normalize capitalization of site names and filter out non-target samples
+  mutate(Site = str_to_title(Site)) %>%
+  filter(!is.na(Site), Site != "Undetermined") %>%
+  mutate(Date_Collected = as.Date(Date_Collected))
+
+# ------------------------------------------------
+# Define paired sampling windows and balanced nests
+# ------------------------------------------------
+dates_larrick  <- as.Date(c("2024-03-17","2024-03-24","2024-03-31","2024-04-07"))
+dates_mckenzie <- as.Date(c("2024-03-18","2024-03-25","2024-04-01","2024-04-08"))
+
+larrick_nests  <- c("L1","L2","L3")
+mckenzie_keep  <- c("M1","M6","M8")
+
+# ------------------------------------------------
+# Convert to week-based representation for robust matching
+# ------------------------------------------------
+paired_df <- df %>%
+  mutate(Week = floor_date(Date_Collected, unit = "week", week_start = 1)) %>%
+  filter(
+    (Site == "Larrick"  & Nest_ID %in% larrick_nests &
+       Week %in% floor_date(dates_larrick,  unit = "week", week_start = 1)) |
+    (Site == "Mckenzie" & Nest_ID %in% mckenzie_keep &
+       Week %in% floor_date(dates_mckenzie, unit = "week", week_start = 1))
+  )
+
+cat("✅ Paired-week subset created with", nrow(paired_df),
+    "rows from", length(unique(paired_df$Sample_ID)), "samples across sites.\n\n")
+
+# ------------------------------------------------
+# 1. Export raw paired-week subset
+# ------------------------------------------------
+write_csv(paired_df,
+          file.path(out_dir, "paired_week_subset_raw.csv"))
+
+# ------------------------------------------------
+# 2. Summarize detection frequency and richness per Site × Guild × Threshold
+# ------------------------------------------------
+site_summary <- paired_df %>%
+  group_by(Site, Guild, Threshold) %>%
+  summarise(
+    mean_detection = mean(Detection_Freq, na.rm = TRUE),
+    sd_detection   = sd(Detection_Freq, na.rm = TRUE),
+    se_detection   = sd_detection / sqrt(n()),
+    mean_richness  = mean(Richness, na.rm = TRUE),
+    sd_richness    = sd(Richness, na.rm = TRUE),
+    se_richness    = sd_richness / sqrt(n()),
+    n_samples      = n(),
+    .groups = "drop"
+  )
+
+write_csv(site_summary,
+          file.path(out_dir, "paired_week_summary_by_site.csv"))
+
+# ------------------------------------------------
+# 3. Summarize per-nest detection and richness
+# ------------------------------------------------
+nest_summary <- paired_df %>%
+  group_by(Site, Nest_ID, Guild, Threshold) %>%
+  summarise(
+    mean_detection = mean(Detection_Freq, na.rm = TRUE),
+    mean_richness  = mean(Richness, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(nest_summary,
+          file.path(out_dir, "paired_week_summary_by_nest.csv"))
+
+# ------------------------------------------------
+# 4. Sanity check output
+# ------------------------------------------------
+site_counts <- paired_df %>% count(Site)
+cat("✅ Site representation in paired subset:\n")
+print(site_counts)
+
+cat("\n✅ Exported summary files:\n")
+cat(" - paired_week_subset_raw.csv\n")
+cat(" - paired_week_summary_by_site.csv\n")
+cat(" - paired_week_summary_by_nest.csv\n")
+cat("\nAll saved to:", out_dir, "\n")
+
+```
+
+
+### GLM analysis: overlapping months (same year)
+```{r}
+
+# ================================================================
+# 1B – GLM analysis: overlapping months (same year)
+# Comparing Larrick vs McKenzie for Truffle and Epigeous ECM
+# ================================================================
+
+library(tidyverse)
+library(broom)
+
+# ------------------------------------------------
+# Paths
+# ------------------------------------------------
+data_fp <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Larrick_vs_Mckenzie/overlapping_months_same_year/paired_site_summary.csv"
+out_dir <- "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Larrick_vs_Mckenzie/overlapping_months_same_year"
+
+# ------------------------------------------------
+# Load data
+# ------------------------------------------------
+df <- read_csv(data_fp, show_col_types = FALSE) %>%
+  mutate(
+    Site = factor(Site, levels = c("Larrick", "Mckenzie")),
+    Guild = factor(Guild, levels = c("Truffle", "Epigeous_ECM")),
+    Threshold = as.numeric(Threshold)
+  )
+
+# ------------------------------------------------
+# Helper function to check overdispersion
+# ------------------------------------------------
+check_overdispersion <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model, type = "pearson")
+  sum(rp^2) / rdf
+}
+
+# ------------------------------------------------
+# Fit GLMs per guild and response
+# ------------------------------------------------
+responses <- c("Detection_Count", "OTU_Richness")
+results <- list()
+
+for (g in levels(df$Guild)) {
+  for (r in responses) {
+    sub <- df %>% filter(Guild == g)
+    
+    message(glue::glue("Fitting {r} model for {g}..."))
+    
+    # Poisson GLM
+    model <- glm(as.formula(paste(r, "~ Site * Threshold")), data = sub, family = poisson)
+    
+    disp <- check_overdispersion(model)
+    message(glue::glue("  Overdispersion ratio = {round(disp, 2)}"))
+    
+    if (disp > 1.5) {
+      message("  → Overdispersed, refitting with quasipoisson.")
+      model <- glm(as.formula(paste(r, "~ Site * Threshold")), data = sub, family = quasipoisson)
+      family_used <- "quasipoisson"
+    } else {
+      family_used <- "poisson"
+    }
+    
+    # Summarize results
+    tidy_res <- broom::tidy(model) %>%
+      mutate(Guild = g, Response = r, Family = family_used)
+    
+    results[[paste(g, r, sep = "_")]] <- tidy_res
+  }
+}
+
+# ------------------------------------------------
+# Combine and save
+# ------------------------------------------------
+final_results <- bind_rows(results)
+out_fp <- file.path(out_dir, "glm_results_1B.csv")
+write_csv(final_results, out_fp)
+
+message(glue::glue("✅ GLM results saved to: {out_fp}"))
+
+# ------------------------------------------------
+# Optional: summary table of model significance
+# ------------------------------------------------
+summary_table <- final_results %>%
+  filter(term %in% c("SiteMckenzie", "Threshold", "SiteMckenzie:Threshold")) %>%
+  select(Guild, Response, term, estimate, std.error, statistic, p.value, Family)
+
+print(summary_table)
+
+```
+
+
+#!/usr/bin/env python3
+# ================================================================
+# Rebuild site × guild × threshold totals directly from raw data
+# and export paired_site_summary.csv for line plots
+# ================================================================
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# ------------------------------------------------
+# Paths
+# ------------------------------------------------
+base = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST")
+work = base / "working_data"
+outdir = base / "Larrick_vs_Mckenzie/overlapping_months_same_year"
+
+otu_fp   = work / "otu_table_collapsed_relative.csv"
+guild_fp = work / "guild_table_collapsed.csv"
+meta_fp  = work / "metadata.csv"
+
+out_det  = outdir / "recomputed_detection_totals.svg"
+out_rich = outdir / "recomputed_richness_totals.svg"
+paired_out = outdir / "paired_site_summary.csv"
+
+# ------------------------------------------------
+# Load data
+# ------------------------------------------------
+otu = pd.read_csv(otu_fp)
+guild = pd.read_csv(guild_fp)
+meta = pd.read_csv(meta_fp)
+
+# Normalize metadata
+meta["Site"] = meta["Site"].str.strip().str.title()
+meta = meta[meta["Site"].isin(["Larrick", "Mckenzie"])]
+
+# Filter relevant guilds
+guild = guild[guild["primary_lifestyle"] == "ectomycorrhizal"].copy()
+guild["Guild"] = guild["Fruitbody_type_template"].map({
+    "gasteroid-hypogeous": "Truffle",
+    "agaricoid": "Epigeous_ECM",
+    "gasteroid": "Epigeous_ECM",
+    "clavarioid": "Epigeous_ECM",
+    "apothecium_(hymenium_on_surface)": "Epigeous_ECM"
+})
+guild = guild[~guild["Genus"].isin(["Pulvinula", "Geopora", "Ionopeziza"])]
+guild = guild[guild["OTU_ID"] != "OTU2849"]
+guild = guild.dropna(subset=["Guild"])
+
+# Merge guild info into OTU table
+otu = otu.rename(columns={otu.columns[0]: "OTU_ID"})
+otu = otu.merge(guild[["OTU_ID", "Guild"]], on="OTU_ID", how="inner")
+
+# Melt to long format
+otu_long = otu.melt(id_vars=["OTU_ID", "Guild"], var_name="Sample_ID", value_name="RA")
+
+# Add metadata (site info)
+otu_long = otu_long.merge(meta[["Sample_ID", "Site"]], on="Sample_ID", how="left")
+otu_long = otu_long.dropna(subset=["Site"])
+
+# ------------------------------------------------
+# Compute detections across thresholds
+# ------------------------------------------------
+thresholds = [0.2, 0.5, 1.0, 1.5]
+records = []
+
+for t in thresholds:
+    det = otu_long[otu_long["RA"] >= t].copy()
+    for (site, guild_name), sub in det.groupby(["Site", "Guild"]):
+        detected_samples = sub["Sample_ID"].nunique()
+        unique_otus = sub["OTU_ID"].nunique()
+        records.append({
+            "Site": site,
+            "Guild": guild_name,
+            "Threshold": t,
+            "Detection_Count": detected_samples,
+            "OTU_Richness": unique_otus
+        })
+
+df = pd.DataFrame(records)
+
+# ------------------------------------------------
+# Plotting setup
+# ------------------------------------------------
+sns.set_context("talk")
+palette = sns.color_palette("Set2", 2)
+sites = ["Larrick", "Mckenzie"]
+guilds = ["Truffle", "Epigeous_ECM"]
+
+def plot_metric(metric, ylabel, title, outfile):
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    for i, site in enumerate(sites):
+        sub = df[df["Site"] == site]
+        sns.barplot(
+            data=sub,
+            x="Threshold",
+            y=metric,
+            hue="Guild",
+            hue_order=guilds,
+            palette=palette,
+            ax=ax[i]
+        )
+        ax[i].set_title(site, fontweight="bold")
+        ax[i].set_xlabel("Relative Abundance Threshold (%)")
+        ax[i].set_ylabel(ylabel if i == 0 else "")
+        ax[i].grid(False)
+        sns.despine(ax=ax[i])
+        ax[i].set_ylim(bottom=0)
+
+    handles, labels = ax[0].get_legend_handles_labels()
+    fig.legend(handles, labels, title="Guild", loc="upper center", ncol=2, frameon=False)
+    fig.suptitle(title, fontweight="bold", y=1.05)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"✅ Saved: {outfile}")
+
+# ------------------------------------------------
+# Run plots
+# ------------------------------------------------
+plot_metric(
+    "Detection_Count",
+    "Number of Samples with Guild Detections",
+    "Total Detections: Site × Guild × Threshold",
+    out_det
+)
+
+plot_metric(
+    "OTU_Richness",
+    "Number of Unique OTUs Detected",
+    "Total OTU Richness: Site × Guild × Threshold",
+    out_rich
+)
+
+# ------------------------------------------------
+# Save combined summary table for downstream use
+# ------------------------------------------------
+df.to_csv(paired_out, index=False)
+print(f"✅ Exported combined data table to {paired_out}")
+
+
+
+
+#!/usr/bin/env python3
+# ================================================================
+# Generate site × guild × threshold line plots (detections & richness)
+# Counts represent total OTU–sample detections (not normalized)
+# ================================================================
+
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ------------------------------------------------
+# Paths
+# ------------------------------------------------
+base = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/Larrick_vs_Mckenzie/overlapping_months_same_year")
+data_fp = base / "paired_site_summary.csv"
+
+# Output base names
+out_combined_det = base / "lineplot_combined_detections.svg"
+out_combined_rich = base / "lineplot_combined_richness.svg"
+out_split_truffle_det = base / "lineplot_truffle_detections.svg"
+out_split_truffle_rich = base / "lineplot_truffle_richness.svg"
+out_split_epi_det = base / "lineplot_epigeous_detections.svg"
+out_split_epi_rich = base / "lineplot_epigeous_richness.svg"
+
+# ------------------------------------------------
+# Load data
+# ------------------------------------------------
+df = pd.read_csv(data_fp)
+df["Threshold"] = df["Threshold"].astype(str)  # treat thresholds as categorical
+df["Site"] = df["Site"].str.title()
+df = df.sort_values(["Guild", "Site", "Threshold"])
+
+# ------------------------------------------------
+# Plotting style
+# ------------------------------------------------
+sns.set_context("talk")
+palette = sns.color_palette("Set2", 2)
+guild_colors = {"Truffle": palette[0], "Epigeous_ECM": palette[1]}
+site_styles = {"Larrick": "dashed", "Mckenzie": "solid"}
+
+# ------------------------------------------------
+# Helper: line plot function
+# ------------------------------------------------
+def make_lineplot(data, metric, ylabel, title, outfile, split_by_guild=False):
+    plt.figure(figsize=(7, 5))
+    ax = plt.gca()
+
+    if split_by_guild:
+        guild_name = data["Guild"].iloc[0]
+        color = guild_colors[guild_name]
+        for site, subset in data.groupby("Site"):
+            linestyle = site_styles.get(site, "solid")
+            ax.plot(
+                subset["Threshold"],
+                subset[metric],
+                label=f"{site}",
+                color=color,
+                linestyle=linestyle,
+                marker="o",
+                linewidth=2.5
+            )
+        plt.title(guild_name.replace("_", " "), fontweight="bold")
+        plt.legend(title="Site", frameon=False)
+    else:
+        for (guild, site), subset in data.groupby(["Guild", "Site"]):
+            color = guild_colors[guild]
+            linestyle = site_styles.get(site, "solid")
+            ax.plot(
+                subset["Threshold"],
+                subset[metric],
+                label=f"{guild} ({site})",
+                color=color,
+                linestyle=linestyle,
+                marker="o",
+                linewidth=2.5
+            )
+        plt.title(title, fontweight="bold")
+        plt.legend(title="Guild (color) / Site (line)", frameon=False)
+
+    ax.set_xlabel("Relative Abundance Threshold (%)")
+    ax.set_ylabel(ylabel)
+    ax.set_ylim(bottom=0)
+    sns.despine(ax=ax)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"✅ Saved: {outfile}")
+
+# ------------------------------------------------
+# Recalculate true detection totals (raw counts)
+# ------------------------------------------------
+# Use Detection_Count column for OTU–sample detections if you’ve already computed it that way.
+# Otherwise, here’s how to recompute total detection events from scratch:
+# (Uncomment this block if needed)
+# df["Detection_Count"] = df.groupby(["Site", "Guild", "Threshold"])["Detection_Count"].transform("sum")
+
+# ------------------------------------------------
+# 1. Detection Totals (raw counts)
+# ------------------------------------------------
+make_lineplot(
+    df,
+    metric="Detection_Count",
+    ylabel="Total OTU–Sample Detections",
+    title="Total Detections by Site × Guild × Threshold",
+    outfile=out_combined_det,
+    split_by_guild=False
+)
+
+make_lineplot(
+    df[df["Guild"] == "Truffle"],
+    metric="Detection_Count",
+    ylabel="Total OTU–Sample Detections",
+    title="Truffle Detections Across Sites",
+    outfile=out_split_truffle_det,
+    split_by_guild=True
+)
+
+make_lineplot(
+    df[df["Guild"] == "Epigeous_ECM"],
+    metric="Detection_Count",
+    ylabel="Total OTU–Sample Detections",
+    title="Epigeous ECM Detections Across Sites",
+    outfile=out_split_epi_det,
+    split_by_guild=True
+)
+
+# ------------------------------------------------
+# 2. OTU Richness plots
+# ------------------------------------------------
+make_lineplot(
+    df,
+    metric="OTU_Richness",
+    ylabel="Number of Unique OTUs Detected",
+    title="OTU Richness by Site × Guild × Threshold",
+    outfile=out_combined_rich,
+    split_by_guild=False
+)
+
+make_lineplot(
+    df[df["Guild"] == "Truffle"],
+    metric="OTU_Richness",
+    ylabel="Number of Unique OTUs Detected",
+    title="Truffle OTU Richness Across Sites",
+    outfile=out_split_truffle_rich,
+    split_by_guild=True
+)
+
+make_lineplot(
+    df[df["Guild"] == "Epigeous_ECM"],
+    metric="OTU_Richness",
+    ylabel="Number of Unique OTUs Detected",
+    title="Epigeous ECM OTU Richness Across Sites",
+    outfile=out_split_epi_rich,
+    split_by_guild=True
+)
+
+
+
+
+###### PLOT FIGURE 8 ########
+
+#!/usr/bin/env python3
+# ================================================================
+# Rebuild site × guild × threshold totals directly from raw data
+# ================================================================
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import itertools
+
+# ------------------------------------------------
+# Paths
+# ------------------------------------------------
+base = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST")
+work = base / "working_data"
+outdir = base / "Larrick_vs_Mckenzie"
+
+otu_fp   = work / "otu_table_collapsed_relative.csv"
+guild_fp = work / "guild_table_collapsed.csv"
+meta_fp  = work / "metadata.csv"
+
+out_det  = outdir / "recomputed_detection_totals.svg"
+out_rich = outdir / "recomputed_richness_totals.svg"
+
+# ------------------------------------------------
+# Load data
+# ------------------------------------------------
+otu = pd.read_csv(otu_fp)
+guild = pd.read_csv(guild_fp)
+meta = pd.read_csv(meta_fp)
+
+# Normalize
+meta["Site"] = meta["Site"].str.strip().str.title()
+meta = meta[meta["Site"].isin(["Larrick", "Mckenzie"])]
+
+# Filter relevant guilds
+guild = guild[guild["primary_lifestyle"] == "ectomycorrhizal"].copy()
+guild["Guild"] = guild["Fruitbody_type_template"].map({
+    "gasteroid-hypogeous": "Truffle",
+    "agaricoid": "Epigeous_ECM",
+    "gasteroid": "Epigeous_ECM",
+    "clavarioid": "Epigeous_ECM",
+    "apothecium_(hymenium_on_surface)": "Epigeous_ECM"
+})
+guild = guild[~guild["Genus"].isin(["Pulvinula","Geopora","Ionopeziza"])]
+guild = guild[guild["OTU_ID"] != "OTU2849"]
+guild = guild.dropna(subset=["Guild"])
+
+# Merge guild info into OTU table
+otu = otu.rename(columns={otu.columns[0]: "OTU_ID"})
+otu = otu.merge(guild[["OTU_ID", "Guild"]], on="OTU_ID", how="inner")
+
+# Melt to long format
+otu_long = otu.melt(id_vars=["OTU_ID", "Guild"], var_name="Sample_ID", value_name="RA")
+
+# Add metadata (site info)
+otu_long = otu_long.merge(meta[["Sample_ID", "Site"]], on="Sample_ID", how="left")
+otu_long = otu_long.dropna(subset=["Site"])
+
+# ------------------------------------------------
+# Compute detections across thresholds
+# ------------------------------------------------
+thresholds = [0.2, 0.5, 1.0, 1.5]
+records = []
+
+for t in thresholds:
+    det = otu_long[otu_long["RA"] >= t].copy()
+    for (site, guild_name), sub in det.groupby(["Site", "Guild"]):
+        detected_samples = sub["Sample_ID"].nunique()
+        unique_otus = sub["OTU_ID"].nunique()
+        records.append({
+            "Site": site,
+            "Guild": guild_name,
+            "Threshold": t,
+            "Detection_Count": detected_samples,
+            "OTU_Richness": unique_otus
+        })
+
+df = pd.DataFrame(records)
+
+# ------------------------------------------------
+# Plotting
+# ------------------------------------------------
+sns.set_context("talk")
+palette = sns.color_palette("Set2", 2)
+sites = ["Larrick", "Mckenzie"]
+guilds = ["Truffle", "Epigeous_ECM"]
+
+def plot_metric(metric, ylabel, title, outfile):
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    for i, site in enumerate(sites):
+        sub = df[df["Site"] == site]
+        sns.barplot(
+            data=sub,
+            x="Threshold",
+            y=metric,
+            hue="Guild",
+            hue_order=guilds,
+            palette=palette,
+            ax=ax[i]
+        )
+        ax[i].set_title(site, fontweight="bold")
+        ax[i].set_xlabel("Relative Abundance Threshold (%)")
+        ax[i].set_ylabel(ylabel if i == 0 else "")
+        ax[i].grid(False)
+        sns.despine(ax=ax[i])
+        ax[i].set_ylim(bottom=0)
+
+    handles, labels = ax[0].get_legend_handles_labels()
+    fig.legend(handles, labels, title="Guild", loc="upper center", ncol=2, frameon=False)
+    fig.suptitle(title, fontweight="bold", y=1.05)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"✅ Saved: {outfile}")
+
+plot_metric("Detection_Count", "Number of Samples with Guild Detections",
+            "Total Detections: Site × Guild × Threshold", out_det)
+
+plot_metric("OTU_Richness", "Number of Unique OTUs Detected",
+            "Total OTU Richness: Site × Guild × Threshold", out_rich)
+
