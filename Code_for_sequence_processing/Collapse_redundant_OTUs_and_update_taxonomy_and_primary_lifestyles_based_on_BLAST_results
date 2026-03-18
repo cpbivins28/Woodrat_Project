@@ -1,0 +1,280 @@
+import pandas as pd
+import os
+
+# ============================================================
+# File paths
+# ============================================================
+base_dir = "/Users/cbivins/Desktop/Woodrat_Project_NEATEST/testing_lower_filters_with_AMPtk"
+
+otu_path = os.path.join(base_dir, "otu_table_raw_filtered.csv")
+guild_path = os.path.join(base_dir, "guild_table.csv")
+
+otu_out = os.path.join(base_dir, "otu_table_collapsed.csv")
+otu_rel_out = os.path.join(base_dir, "otu_table_collapsed_relative.csv")
+guild_out = os.path.join(base_dir, "guild_table_collapsed_manual_updates.csv")
+log_out = os.path.join(base_dir, "collapse_verification_log.csv")
+
+
+# ============================================================
+# Collapse map
+# Representative OTU : [OTUs to merge into it]
+# ============================================================
+collapse_map = {
+
+    "OTU953": ["OTU2476"],
+
+    "OTU18": [
+        "OTU5719", "OTU79", "OTU112", "OTU237",
+        "OTU4095", "OTU5096", "OTU5733", "OTU5871"
+    ],
+
+    "OTU28": ["OTU3378"],
+
+    "OTU10": ["OTU84", "OTU283", "OTU2161", "OTU3165", "OTU5094", "OTU5386"],
+
+    "OTU508": ["OTU2167"],
+
+    "OTU1368": ["OTU1647", "OTU1876", "OTU4897"],
+
+    "OTU3619": ["OTU4812"],
+
+    "OTU26": ["OTU39", "OTU116", "OTU394", "OTU3348", "OTU4120", "OTU5829"],
+
+    "OTU220": ["OTU5357", "OTU6062"],
+
+    "OTU831": ["OTU3014"],
+
+    "OTU41": ["OTU908"],
+
+    "OTU510": ["OTU4696"],
+
+    "OTU203": ["OTU4478"]
+}
+
+
+# ============================================================
+# Lifestyle updates
+# OTU : new lifestyle
+# ============================================================
+lifestyle_updates = {
+    "OTU1648": "mycoparasite",
+    "OTU79": "ectomycorrhizal",
+    "OTU112": "ectomycorrhizal",
+    "OTU237": "ectomycorrhizal",
+    "OTU4095": "ectomycorrhizal",
+    "OTU5096": "ectomycorrhizal",
+    "OTU5719": "ectomycorrhizal",
+    "OTU5733": "ectomycorrhizal",
+    "OTU5871": "ectomycorrhizal",
+    "OTU46": "ectomycorrhizal",
+    "OTU361": "ectomycorrhizal"
+}
+
+
+# ============================================================
+# Fruitbody template updates
+# OTU : new fruitbody template
+# ============================================================
+fruitbody_updates = {
+
+    # Xerocomellus hypogeous types
+    "OTU18": "gasteroid-hypogeous",
+    "OTU79": "gasteroid-hypogeous",
+    "OTU112": "gasteroid-hypogeous",
+    "OTU237": "gasteroid-hypogeous",
+    "OTU4095": "gasteroid-hypogeous",
+    "OTU5096": "gasteroid-hypogeous",
+    "OTU5719": "gasteroid-hypogeous",
+    "OTU5733": "gasteroid-hypogeous",
+    "OTU5871": "gasteroid-hypogeous",
+
+    # Rhizopogon hypogeous
+    "OTU437": "gasteroid-hypogeous",
+    "OTU474": "gasteroid-hypogeous",
+    "OTU1133": "gasteroid-hypogeous",
+
+    # Other gasteroid-hypogeous
+    "OTU808": "gasteroid-hypogeous",
+    "OTU4539": "gasteroid-hypogeous",
+
+    # Apothecial
+    "OTU361": "apothecium_(hymenium_on_surface)",
+    "OTU556": "apothecium_(hymenium_on_surface)",
+
+    # Geopora types
+    "OTU831": "gasteroid-hypogeous",
+    "OTU3014": "gasteroid-hypogeous"
+}
+
+
+# ============================================================
+# Taxonomy updates
+# OTU : {"Genus": <value or None>, "Species": <value>}
+# Genus only changes if explicitly stated
+# ============================================================
+taxonomy_updates = {
+
+    "OTU82":  {"Genus": None, "Species": "Amanita constricta"},
+    "OTU953": {"Genus": None, "Species": "Inocybe geophylla"},
+    "OTU1648": {"Genus": None, "Species": "Entoloma undatum"},
+    "OTU2114": {"Genus": None, "Species": "Cortinarius sp. ca01"},
+    "OTU2130": {"Genus": None, "Species": "Cortinarius vellingae"},
+    "OTU2476": {"Genus": None, "Species": "Inocybe geophylla"},
+    "OTU2766": {"Genus": None, "Species": "Phlegmacium affabile"},
+    "OTU3200": {"Genus": None, "Species": "Laccaria proxima"},
+
+    "OTU10": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU18": {"Genus": None, "Species": "Xerocomellus behrii"},
+    "OTU84": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU283": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU2161": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU3165": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU5094": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+    "OTU5386": {"Genus": None, "Species": "Melanogaster macrocarpus CA01"},
+
+    "OTU79": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU112": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU237": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU4095": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5096": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5719": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5733": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+    "OTU5871": {"Genus": "Xerocomellus", "Species": "Xerocomellus behrii"},
+
+    "OTU437": {"Genus": None, "Species": None},
+    "OTU474": {"Genus": None, "Species": "Rhizopogon sp. ca06"},
+    "OTU1133": {"Genus": None, "Species": "Rhizopogon sp. ca07"},
+
+    "OTU2167": {"Genus": None, "Species": "Astraeus pteridis"},
+
+    # Alpova but placed in Melanogaster
+    "OTU3883": {"Genus": "Melanogaster", "Species": "Alpova trappei"},
+
+    "OTU3619": {"Genus": None, "Species": "Hysterangium sp. ca07"},
+
+    "OTU26": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU39": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU116": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU394": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU3348": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU4120": {"Genus": None, "Species": "Tuber candidum"},
+    "OTU5829": {"Genus": None, "Species": "Tuber candidum"},
+
+    "OTU46": {"Genus": None, "Species": "Peziza ellipsospora"},
+    "OTU361": {"Genus": None, "Species": "Ionopeziza sp. ca01"},
+    "OTU637": {"Genus": None, "Species": "Genea af harknessii"},
+
+    "OTU831": {"Genus": None, "Species": "Geopora cooperi"},
+    "OTU3014": {"Genus": None, "Species": "Geopora cooperi"},
+
+    "OTU220": {"Genus": None, "Species": "Tuber sp. SOC1404"},
+    "OTU5357": {"Genus": None, "Species": "Tuber sp. SOC1404"},
+    "OTU6062": {"Genus": None, "Species": "Tuber sp. SOC1404"},
+
+    "OTU3183": {"Genus": None, "Species": "Leucophleps spinispora"},
+
+    "OTU41": {"Genus": None, "Species": "Russula sp. CA10"},
+    "OTU238": {"Genus": None, "Species": "Russula grundii"},
+    "OTU510": {"Genus": None, "Species": None},
+    "OTU767": {"Genus": None, "Species": "Lactarius alnicola"},
+    "OTU808": {"Genus": None, "Species": "Lactarius af. Southworthiae"},
+    "OTU835": {"Genus": None, "Species": "Russula cremicolor CA01"},
+    "OTU3152": {"Genus": None, "Species": "Russula sp. CA02"},
+    "OTU4539": {"Genus": None, "Species": "Russula sp. CA23"}
+}
+
+
+# ============================================================
+# Load input tables
+# ============================================================
+otu = pd.read_csv(otu_path, index_col=0)
+guild = pd.read_csv(guild_path)
+
+
+# ============================================================
+# Apply guild updates
+# ============================================================
+# Lifestyle
+guild["primary_lifestyle"] = guild.apply(
+    lambda row: lifestyle_updates.get(row["OTU_ID"], row["primary_lifestyle"]),
+    axis=1
+)
+
+# Fruitbody type
+guild["Fruitbody_type_template"] = guild.apply(
+    lambda row: fruitbody_updates.get(row["OTU_ID"], row["Fruitbody_type_template"]),
+    axis=1
+)
+
+# Taxonomy (genus and species)
+def update_taxonomy(row):
+    otu_id = row["OTU_ID"]
+    if otu_id in taxonomy_updates:
+        upd = taxonomy_updates[otu_id]
+        if upd["Genus"] is not None:
+            row["Genus"] = upd["Genus"]
+        if upd["Species"] is not None:
+            row["Species"] = upd["Species"]
+    return row
+
+guild = guild.apply(update_taxonomy, axis=1)
+
+
+# ============================================================
+# Collapse OTU table
+# ============================================================
+otu_collapsed = otu.copy()
+verification_log = []
+
+for rep, children in collapse_map.items():
+    if rep not in otu_collapsed.index:
+        continue
+
+    for child in children:
+        if child not in otu_collapsed.index:
+            continue
+
+        # Add counts
+        otu_collapsed.loc[rep] += otu_collapsed.loc[child]
+
+        # Log merges
+        for sample_id in otu.columns:
+            if otu.loc[child, sample_id] > 0:
+                verification_log.append({
+                    "Representative_OTU": rep,
+                    "Merged_OTU": child,
+                    "Sample_ID": sample_id,
+                    "Merged_Reads": otu.loc[child, sample_id]
+                })
+
+        # Remove the child OTU
+        otu_collapsed = otu_collapsed.drop(child)
+
+
+# ============================================================
+# Drop collapsed-away OTUs from guild
+# ============================================================
+collapsed_children = {child for group in collapse_map.values() for child in group}
+guild = guild[~guild["OTU_ID"].isin(collapsed_children)]
+
+
+# ============================================================
+# Produce relative abundance table
+# ============================================================
+otu_relative = otu_collapsed.div(otu_collapsed.sum(axis=0), axis=1) * 100
+
+
+# ============================================================
+# Output
+# ============================================================
+otu_collapsed.to_csv(otu_out)
+otu_relative.to_csv(otu_rel_out)
+guild.to_csv(guild_out, index=False)
+pd.DataFrame(verification_log).to_csv(log_out, index=False)
+
+print("Complete.")
+print("Collapsed OTU table:", otu_out)
+print("Relative abundance table:", otu_rel_out)
+print("Updated guild table:", guild_out)
+print("Collapse log:", log_out)
+
