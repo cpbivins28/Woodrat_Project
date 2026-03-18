@@ -1,0 +1,127 @@
+
+##
+##
+## DATA PROCESSING WITH TRIMMOMATIC AND AMPTK
+##
+##
+##
+
+
+
+### Processing Woodrat Data with TRIMMOMATIC 
+
+
+# 1. Upload files to UC MERCED HPC with scp: 
+
+ssh cbivins@login.rc.ucmerced.edu
+
+
+scp -r /Volumes/Seagate\ Portabl/Woodrat_project/BaseCalls cbivins@login.rc.ucmerced.edu:/home/cbivins/data/woodrats
+
+
+# 2. Rename MiSeq fastq.gz files
+## The trimmomatic script will not work if there are any underscore symbols anywhere other than where the file names delimit R1 vs R2 files. There are underscores separating every part of the sample IDs, so these need to be changed to dashes. 
+
+import os
+
+def rename_files():
+    # Get all files in current directory
+    files = os.listdir('.')
+    
+    for old_name in files:
+        # Skip if it's not a fastq.gz file
+        if not old_name.endswith('.fastq.gz') and old_name != 'laneBarcode.html':
+            continue
+            
+        # Split the filename at _R1_ or _R2_
+        new_name = old_name
+        if '_R1_' in new_name:
+            parts = new_name.split('_R1_')
+            # Replace underscores with dashes in the first part
+            parts[0] = parts[0].replace('_', '-')
+            # Join back with _R1_
+            new_name = '_R1_'.join(parts)
+        elif '_R2_' in new_name:
+            parts = new_name.split('_R2_')
+            # Replace underscores with dashes in the first part
+            parts[0] = parts[0].replace('_', '-')
+            # Join back with _R2_
+            new_name = '_R2_'.join(parts)
+        else:
+            # If no R1 or R2, just replace all underscores
+            new_name = new_name.replace('_', '-')
+        
+        # Rename the file if the name has changed
+        if new_name != old_name:
+            try:
+                os.rename(old_name, new_name)
+                print(f'Renamed: {old_name} -> {new_name}')
+            except OSError as e:
+                print(f'Error renaming {old_name}: {e}')
+
+if __name__ == '__main__':
+    # Ask for confirmation before proceeding
+    print("This script will rename files in the current directory.")
+    response = input("Do you want to proceed? (y/n): ")
+    if response.lower() == 'y':
+        rename_files()
+    else:
+        print("Operation cancelled.")
+
+# 3. Create the custom Trimmomatic script to run on the Woodrat data:
+
+perl make_Trimmomatic_forAMPtk.pl -d /home/cbivins/data/woodrats/BaseCalls -p /home/cbivins/data/woodrats/Trimmomatic-0.39/trimmomatic-0.39.jar -s 4:15
+
+
+#4. Run the custom my_Make_Trimmomatic_forAMPtk.sh script 
+
+./my_Make_Trimmomatic_forAMPtk.sh
+
+
+# 5. Use the files in my_Trimmomatic_OUTPUT to run AMPtk
+
+conda activate amptk_compatible 
+
+### AMPTK Pipeline
+
+# 1 - (pre-processing) - Processes the quality-trimmed sequencing data by demultiplexing, merging 
+# paired-end reads, filtering out short reads, rescuing forward reads without corresponding reverse reads, 
+# and preparing the data for further steps like OTU clustering and taxonomy assignment, while also cleaning
+# up intermediate files. This ensures the sequencing data is properly formatted and prepared for downstream analyses.
+# Also, makes mydata file #simple folder of PE MiSeq data.
+
+amptk illumina -i /home/cbivins/data/woodrats/my_Trimmomatic_OUTPUT -o ITS -f ITS1-F -r ITS2 -l 250 -p on --min_len 150 --reads paired --rescue_forward on --require_primer off --cleanup
+
+
+##### IMPORTANT!!!!! #######
+# This is the stage at which you need to manually add your sample metadata to your ITS.mapping_file.txt!!!!!!
+# If you don't do this, the final BIOM file that you import into RStudio will NOT have metadata, and adding the metadata 
+# at that stage is a gigantic nightmarish headache! Use scp to import the ITS.mapping_file.txt that is one 
+# of the output files from Step 1 in the AMPtk pipeline. Open this up in excel and do whatever you need to do to 
+# add the relevant metadata to the file. Before you re-import the modified ITS.mapping_file into the computing cluster, delete the original 
+#  ITS.mapping_file.txt from your workspace using "rm ITS.mapping_file.txt". Then, copy the modified file from your 
+# local computer over to the computing cluster using scp again. Use "less ITS.mapping_file.txt" to verify that
+#  the ITS.mapping_file.txt in your working directory contains the relevant metadata.   
+
+scp cbivins@login.rc.ucmerced.edu:/home/cbivins/data/woodrats/amptk/ITS.mapping_file.txt "/Volumes/Seagate Portabl/Woodrat_project/AMPtk_Outputs/"
+
+# after changes have been made and saved, then do the following in the HPC amtpk folder: 
+
+rm ITS.mapping_file.txt 
+
+# Now, scp the modified mapping file from your computer back to the cluster:
+scp "/Volumes/Seagate Portabl/Woodrat_project/AMPtk_Outputs/ITS.mapping_file.txt" cbivins@login.rc.ucmerced.edu:/home/cbivins/data/woodrats/amptk 
+
+
+# 2 - (cluster) - Clusters sequences into OTUs 
+
+amptk cluster -i ITS.demux.fq.gz -o clusterITS --uchime_ref ITS
+
+# 3 (filter OTUs) - Filters out low abundance OTUs
+
+amptk filter -i clusterITS.otu_table.txt -f clusterITS.cluster.otus.fa -o filterITS -p 0.005 --min_reads_otu 2
+
+## 4 (assign taxonomy) - Assigns taxonomy to OTUs
+
+amptk taxonomy -i filterITS.final.txt -f filterITS.filtered.otus.fa -o taxonomyITS -m ITS.mapping_file_meta.txt -d ITS1 --tax_filter Fungi 
+
