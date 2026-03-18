@@ -1,0 +1,262 @@
+"""
+PURPOSE
+Create a cleaner DOCX supplemental table listing truffle and epigeous ECM OTUs
+ranked by the maximum relative abundance category each OTU achieved anywhere in
+the full dataset.
+
+INPUT
+full_dataset_otu_detection_summary_all_thresholds.csv
+
+OUTPUT
+table_S1_focal_ECM_OTUs_ranked_by_max_RA_bin.docx
+
+LOGIC
+- Read the long summary CSV
+- For each OTU, find the maximum observed RA across all detections
+- Bin OTUs into these mutually exclusive categories:
+    >= 1.5%
+    1.0-1.49%
+    0.5-0.99%
+    0.2-0.49%
+    >0-0.19%
+- Sort rows:
+    1) Truffle first
+    2) then Epigeous ECM
+    3) within guild by descending RA bin
+    4) then taxon name and OTU_ID
+- Export a DOCX table with one row per OTU
+
+NOTES
+- Taxonomy is shown in a single column called "Taxon".
+- If Species is missing, Taxon is rendered as "Genus sp."
+"""
+
+from pathlib import Path
+import pandas as pd
+
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+input_csv = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/full_dataset_threshold_otu_summary/full_dataset_otu_detection_summary_all_thresholds.csv")
+output_docx = Path("/Users/cbivins/Desktop/Woodrat_Project_NEATEST/full_dataset_threshold_otu_summary/table_S1_focal_ECM_OTUs_ranked_by_max_RA_bin.docx")
+
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
+df = pd.read_csv(input_csv)
+
+# --------------------------------------------------
+# Basic checks
+# --------------------------------------------------
+required_cols = {
+    "Guild",
+    "OTU_ID",
+    "Genus",
+    "Species",
+    "Max_RA_When_Detected"
+}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+# --------------------------------------------------
+# Keep one row per OTU using the maximum observed RA
+# across all thresholds and detections
+# --------------------------------------------------
+otu_max = (
+    df.groupby(["Guild", "OTU_ID", "Genus", "Species"], dropna=False, as_index=False)
+      .agg(Max_RA=("Max_RA_When_Detected", "max"))
+)
+
+# --------------------------------------------------
+# Clean taxonomy into a single display column
+# --------------------------------------------------
+def make_taxon_name(genus, species):
+    genus = "" if pd.isna(genus) else str(genus).strip()
+    species = "" if pd.isna(species) else str(species).strip()
+
+    if species == "" or species.lower() in {"sp.", "sp", "na", "nan"}:
+        if genus != "":
+            return f"{genus} sp."
+        return "Unidentified sp."
+
+    # If species already contains the genus, use as is
+    species_words = species.split()
+    if genus != "" and len(species_words) > 0 and species_words[0] == genus:
+        return species
+
+    # Otherwise combine genus + species
+    if genus != "":
+        return f"{genus} {species}"
+
+    return species
+
+otu_max["Taxon"] = otu_max.apply(
+    lambda row: make_taxon_name(row["Genus"], row["Species"]),
+    axis=1
+)
+
+# --------------------------------------------------
+# Bin OTUs by maximum observed RA
+# --------------------------------------------------
+def assign_ra_bin(max_ra):
+    if pd.isna(max_ra):
+        return None
+    if max_ra >= 1.5:
+        return "≥1.5%"
+    elif max_ra >= 1.0:
+        return "1.0-1.49%"
+    elif max_ra >= 0.5:
+        return "0.5-0.99%"
+    elif max_ra >= 0.2:
+        return "0.2-0.49%"
+    elif max_ra > 0:
+        return ">0-0.19%"
+    else:
+        return None
+
+otu_max["Max_RA_Bin"] = otu_max["Max_RA"].apply(assign_ra_bin)
+
+# Drop impossible rows
+otu_max = otu_max[otu_max["Max_RA_Bin"].notna()].copy()
+
+# --------------------------------------------------
+# Display guild names
+# --------------------------------------------------
+guild_display_map = {
+    "Truffle": "Truffle",
+    "Epigeous_ECM": "Epigeous ECM"
+}
+otu_max["Guild_Display"] = otu_max["Guild"].map(guild_display_map).fillna(otu_max["Guild"])
+
+# --------------------------------------------------
+# Sort keys
+# --------------------------------------------------
+guild_sort_map = {
+    "Truffle": 0,
+    "Epigeous_ECM": 1
+}
+otu_max["Guild_Sort"] = otu_max["Guild"].map(guild_sort_map)
+
+ra_bin_sort_map = {
+    "≥1.5%": 0,
+    "1.0-1.49%": 1,
+    "0.5-0.99%": 2,
+    "0.2-0.49%": 3,
+    ">0-0.19%": 4
+}
+otu_max["RA_Bin_Sort"] = otu_max["Max_RA_Bin"].map(ra_bin_sort_map)
+
+# --------------------------------------------------
+# Sort rows
+# --------------------------------------------------
+otu_max = otu_max.sort_values(
+    by=["Guild_Sort", "RA_Bin_Sort", "Taxon", "OTU_ID"],
+    ascending=[True, True, True, True]
+).reset_index(drop=True)
+
+# --------------------------------------------------
+# Build display table
+# --------------------------------------------------
+table_df = otu_max[[
+    "Guild_Display",
+    "OTU_ID",
+    "Taxon",
+    "Max_RA_Bin"
+]].copy()
+
+table_df = table_df.rename(columns={
+    "Guild_Display": "Guild",
+    "Max_RA_Bin": "Maximum RA category"
+})
+
+# --------------------------------------------------
+# DOCX helpers
+# --------------------------------------------------
+def set_cell_text(cell, text, bold=False, font_size=10, align="center"):
+    cell.text = ""
+
+    paragraph = cell.paragraphs[0]
+    run = paragraph.add_run(str(text))
+    run.bold = bold
+    run.font.size = Pt(font_size)
+
+    if align == "left":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    elif align == "right":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    else:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+# --------------------------------------------------
+# Create DOCX
+# --------------------------------------------------
+doc = Document()
+
+section = doc.sections[0]
+section.orientation = WD_ORIENT.LANDSCAPE
+section.page_width, section.page_height = section.page_height, section.page_width
+section.top_margin = Inches(0.6)
+section.bottom_margin = Inches(0.6)
+section.left_margin = Inches(0.6)
+section.right_margin = Inches(0.6)
+
+# Title
+title_par = doc.add_paragraph()
+title_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+title_run = title_par.add_run(
+    "Table S1. Truffle and epigeous ECM OTUs ranked by the maximum relative-abundance category reached in the full dataset."
+)
+title_run.bold = True
+title_run.font.size = Pt(11)
+
+doc.add_paragraph("")
+
+# Note
+note_par = doc.add_paragraph()
+note_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+note_label = note_par.add_run("Note. ")
+note_label.italic = True
+note_label.font.size = Pt(9)
+
+note_text = note_par.add_run(
+    "Each OTU is assigned to a mutually exclusive category based on the maximum relative abundance observed in any sample. "
+    "Rows are ordered with truffle OTUs first, followed by epigeous ECM OTUs, and within each guild by descending maximum relative-abundance category."
+)
+note_text.font.size = Pt(9)
+
+doc.add_paragraph("")
+
+# Table
+table = doc.add_table(rows=1, cols=len(table_df.columns))
+table.alignment = WD_TABLE_ALIGNMENT.CENTER
+table.style = "Table Grid"
+
+# Header
+header_cells = table.rows[0].cells
+for j, col_name in enumerate(table_df.columns):
+    align_mode = "left" if col_name in ["Guild", "OTU_ID", "Taxon"] else "center"
+    set_cell_text(header_cells[j], col_name, bold=True, font_size=10, align=align_mode)
+
+# Body
+for _, row in table_df.iterrows():
+    row_cells = table.add_row().cells
+    for j, col_name in enumerate(table_df.columns):
+        value = row[col_name]
+        align_mode = "left" if col_name in ["Guild", "OTU_ID", "Taxon"] else "center"
+        set_cell_text(row_cells[j], value, bold=False, font_size=10, align=align_mode)
+
+# Save
+doc.save(output_docx)
+
+print("Done.")
+print(f"Saved DOCX table to: {output_docx}")
