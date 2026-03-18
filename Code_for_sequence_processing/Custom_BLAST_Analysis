@@ -149,7 +149,7 @@ print(out_csv)
 
 
 
-########### Code to plot figure 4
+########### Code to plot figure 2
 
 
 #!/usr/bin/env python3
